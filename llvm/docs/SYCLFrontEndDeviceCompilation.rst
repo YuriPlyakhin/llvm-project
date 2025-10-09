@@ -8,11 +8,9 @@ SYCL Front-end device compilation
 .. _sycl_frontend_device_compilation:
 SYCL front-end device compiler parses input source, outlines device part of the
 code, applies additional restrictions on the device code (e.g. no exceptions or
-virtual calls), generates LLVM IR bitcode for the device code only and
-"integration header" which provides information like kernel name, parameters
-order and data type for the runtime library. Multiple LLVM IR bitcodes (in case
+virtual calls), generates LLVM IR bitcode for the device code only. Multiple LLVM IR bitcodes (in case
 of multiple targets) are packaged into a single object by the
-clang-offload-packager.
+llvm-offload-binary.
 
 An example of front-end device compilation command is shown below:
 
@@ -22,7 +20,7 @@ An example of front-end device compilation command is shown below:
 
 Front-end device compilation for SYCL offloading can be split into the following
 components - Device code outlining, SYCL kernel function object lowering,
-Generation of device code diagnostics, and Integration header generation. These
+Generation of device code diagnostics. These
 components are explained in the sections below.
 
 *********************
@@ -121,15 +119,3 @@ SYCL kernel function object (functor or lambda) lowering
 Generation of device code diagnostics
 *************************************
   This component enforces language restrictions on device code.
-
-*****************************
-Integration header generation
-*****************************
-  This component emits information required for binding host and device parts of
-  the SYCL code via OpenCL API. In proposed design, we use SYCL device front-end
-  compiler to produce the integration header for two reasons. First, it must be
-  possible to use any host compiler to produce SYCL heterogeneous applications.
-  Second, even if the same clang compiler is used for the host compilation,
-  information provided in the integration header is used (included) by the SYCL
-  runtime implementation, so the header must be available before the host
-  compilation starts.
