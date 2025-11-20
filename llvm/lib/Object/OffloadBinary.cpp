@@ -185,23 +185,32 @@ OffloadBinary::create(MemoryBufferRef Buf) {
   if (TheHeader->Version != OffloadBinary::Version)
     return errorCodeToError(object_error::parse_failed);
 
+  if (TheHeader->EntriesCount == 0)
+    return errorCodeToError(object_error::parse_failed);
+
   if (TheHeader->Size > Buf.getBufferSize() ||
-      TheHeader->Size < sizeof(Entry) || TheHeader->Size < sizeof(Header))
+      TheHeader->Size < sizeof(Entry) * TheHeader->EntriesCount ||
+      TheHeader->Size < sizeof(Header))
     return errorCodeToError(object_error::unexpected_eof);
 
-  if (TheHeader->EntryOffset > TheHeader->Size - sizeof(Entry) ||
-      TheHeader->EntrySize > TheHeader->Size - sizeof(Header))
+  if (TheHeader->EntriesOffset >
+          TheHeader->Size - sizeof(Entry) * TheHeader->EntriesCount ||
+      TheHeader->EntriesSize > TheHeader->Size - sizeof(Header))
     return errorCodeToError(object_error::unexpected_eof);
 
-  const Entry *TheEntry =
-      reinterpret_cast<const Entry *>(&Start[TheHeader->EntryOffset]);
+  const Entry *Entries =
+      reinterpret_cast<const Entry *>(&Start[TheHeader->EntriesOffset]);
 
-  if (TheEntry->ImageOffset > Buf.getBufferSize() ||
-      TheEntry->StringOffset > Buf.getBufferSize())
-    return errorCodeToError(object_error::unexpected_eof);
+  for (uint32_t I = 0; I < TheHeader->EntriesCount; ++I) {
+    const Entry *TheEntry = &Entries[I];
+
+    if (TheEntry->ImageOffset > Buf.getBufferSize() ||
+        TheEntry->StringOffset > Buf.getBufferSize())
+      return errorCodeToError(object_error::unexpected_eof);
+  }
 
   return std::unique_ptr<OffloadBinary>(
-      new OffloadBinary(Buf, TheHeader, TheEntry));
+      new OffloadBinary(Buf, TheHeader, Entries));
 }
 
 SmallString<0> OffloadBinary::write(const OffloadingImage &OffloadingData) {
