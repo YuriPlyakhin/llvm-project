@@ -56,6 +56,7 @@ Error L0KernelTy::readKernelProperties(L0ProgramTy &Program) {
   CALL_ZE_RET_ERROR(zeKernelGetProperties, zeKernel, &KP);
   KernelPR.SIMDWidth = KP.maxSubgroupSize;
   KernelPR.Width = KP.maxSubgroupSize;
+  KernelPR.NumKernelArgs = KP.numKernelArgs;
 
   if (KP.pNext)
     KernelPR.Width = KPrefGRPSize.preferredMultiple;
@@ -64,6 +65,17 @@ Error L0KernelTy::readKernelProperties(L0ProgramTy &Program) {
     KernelPR.Width = (std::max)(KernelPR.Width, 2 * KernelPR.SIMDWidth);
   }
   KernelPR.MaxThreadGroupSize = KP.maxSubgroupSize * KP.maxNumSubgroups;
+
+  // Query and cache argument sizes if extension is available
+  auto &Context = l0Device.getL0Context();
+  if (KernelPR.NumKernelArgs > 0 && Context.zexKernelGetArgumentSize) {
+    KernelPR.ArgSizes = std::make_unique<uint32_t[]>(KernelPR.NumKernelArgs);
+    for (uint32_t I = 0; I < KernelPR.NumKernelArgs; I++) {
+      CALL_ZE_RET_ERROR(Context.zexKernelGetArgumentSize, zeKernel, I,
+                        &KernelPR.ArgSizes[I]);
+    }
+  }
+
   return Plugin::success();
 }
 
@@ -288,11 +300,21 @@ static Error launchKernelWithImmCmdList(L0DeviceTy &l0Device,
   }
   INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
        "Kernel depends on %zu data copying events.\n", NumWaitEvents);
+
   Error AllErrors = Error::success();
 
-  CALL_ZE_ACCUM_ERROR(AllErrors, zeCommandListAppendLaunchKernel, CmdList,
-                      zeKernel, &KEnv.GroupCounts, Event, NumWaitEvents,
-                      WaitEvents);
+  if (KEnv.IsCooperative) {
+    INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
+         "Launching cooperative kernel " DPxMOD "\n", DPxPTR(zeKernel));
+    CALL_ZE_ACCUM_ERROR(AllErrors, zeCommandListAppendLaunchCooperativeKernel,
+                        CmdList, zeKernel, &KEnv.GroupCounts, Event,
+                        NumWaitEvents, WaitEvents);
+  } else {
+    CALL_ZE_ACCUM_ERROR(AllErrors, zeCommandListAppendLaunchKernel, CmdList,
+                        zeKernel, &KEnv.GroupCounts, Event, NumWaitEvents,
+                        WaitEvents);
+  }
+
   KEnv.Lock.unlock();
   if (AllErrors) {
     if (auto Err = l0Device.releaseEvent(Event))
@@ -339,8 +361,16 @@ static Error launchKernelWithCmdQueue(L0DeviceTy &l0Device,
        "Using regular command list for kernel submission.\n");
 
   ze_event_handle_t Event = nullptr;
-  CALL_ZE_RET_ERROR(zeCommandListAppendLaunchKernel, CmdList, zeKernel,
-                    &KEnv.GroupCounts, Event, 0, nullptr);
+
+  if (KEnv.IsCooperative) {
+    INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
+         "Launching cooperative kernel " DPxMOD "\n", DPxPTR(zeKernel));
+    CALL_ZE_RET_ERROR(zeCommandListAppendLaunchCooperativeKernel, CmdList,
+                      zeKernel, &KEnv.GroupCounts, Event, 0, nullptr);
+  } else {
+    CALL_ZE_RET_ERROR(zeCommandListAppendLaunchKernel, CmdList, zeKernel,
+                      &KEnv.GroupCounts, Event, 0, nullptr);
+  }
   KEnv.Lock.unlock();
   CALL_ZE_RET_ERROR(zeCommandListClose, CmdList);
 
@@ -451,7 +481,7 @@ Error L0KernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 
   auto zeKernel = getZeKernel();
   auto DeviceId = l0Device.getDeviceId();
-  int32_t NumArgs = KernelArgs.NumArgs;
+
   INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId, "Launching kernel " DPxMOD "...\n",
        DPxPTR(zeKernel));
 
@@ -459,6 +489,13 @@ Error L0KernelTy::launchImpl(GenericDeviceTy &GenericDevice,
   auto *IdStr = l0Device.getZeIdCStr();
   auto &Options = Plugin.getOptions();
   bool IsAsync = AsyncInfo && l0Device.asyncEnabled();
+  bool IsCooperative = KernelArgs.Flags.Cooperative;
+
+  if (IsCooperative && !l0Device.supportsCooperativeKernels()) {
+    return Plugin::error(
+        ErrorCode::UNSUPPORTED,
+        "cooperative kernel launch is not supported by the device");
+  }
   if (IsAsync && !AsyncInfo->Queue) {
     AsyncInfo->Queue = reinterpret_cast<void *>(Plugin.getAsyncQueue());
     if (!AsyncInfo->Queue)
@@ -468,7 +505,7 @@ Error L0KernelTy::launchImpl(GenericDeviceTy &GenericDevice,
       IsAsync ? static_cast<AsyncQueueTy *>(AsyncInfo->Queue) : nullptr;
   auto &KernelPR = getProperties();
 
-  L0LaunchEnvTy KEnv(IsAsync, AsyncQueue, KernelPR);
+  L0LaunchEnvTy KEnv(IsAsync, IsCooperative, AsyncQueue, KernelPR);
 
   // Protect from kernel preparation to submission as kernels are shared.
   KEnv.Lock.lock();
@@ -476,17 +513,53 @@ Error L0KernelTy::launchImpl(GenericDeviceTy &GenericDevice,
   if (auto Err = setKernelGroups(l0Device, KEnv, NumThreads, NumBlocks))
     return Err;
 
+  // Validate cooperative kernel launch constraints
+  if (IsCooperative) {
+    uint32_t MaxCooperativeGroupCount = 0;
+    CALL_ZE_RET_ERROR(zeKernelSuggestMaxCooperativeGroupCount, zeKernel,
+                      &MaxCooperativeGroupCount);
+
+    uint32_t TotalGroupCount = KEnv.GroupCounts.groupCountX *
+                               KEnv.GroupCounts.groupCountY *
+                               KEnv.GroupCounts.groupCountZ;
+
+    if (TotalGroupCount > MaxCooperativeGroupCount) {
+      KernelPR.Mtx.unlock();
+      return Plugin::error(
+          ErrorCode::INVALID_ARGUMENT,
+          "cooperative kernel launch failed: requested %u groups exceeds "
+          "maximum %u cooperative groups supported by device",
+          TotalGroupCount, MaxCooperativeGroupCount);
+    }
+
+    INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
+         "Cooperative kernel validated: using %u groups (max: %u)\n",
+         TotalGroupCount, MaxCooperativeGroupCount);
+  }
+
   // Set kernel arguments.
-  for (int32_t I = 0; I < NumArgs; I++) {
-    // Scope code to ease integration with downstream custom code.
-    {
-      void *Arg = (static_cast<void **>(LaunchParams.Data))[I];
-      CALL_ZE_RET_ERROR(zeKernelSetArgumentValue, zeKernel, I, sizeof(Arg),
-                        Arg == nullptr ? nullptr : &Arg);
-      INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
-           "Kernel Pointer argument %" PRId32 " (value: " DPxMOD
-           ") was set successfully for device %s.\n",
-           I, DPxPTR(Arg), IdStr);
+  uint32_t NumArgs = Properties.NumKernelArgs;
+  if (NumArgs > 0) {
+    if (!KernelArgs.ArgSizes && !Properties.ArgSizes)
+      return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                           "level zero plugin requires kernel argument sizes.");
+    // use user provided argument sizes if available, otherwise use sizes from
+    // kernel properties.
+    char *Arg = static_cast<char *>(LaunchParams.Data);
+    for (uint32_t I = 0; I < NumArgs; I++) {
+      // Scope code to ease integration with downstream custom code.
+      {
+        uint32_t ArgSize = KernelArgs.ArgSizes
+                               ? static_cast<uint32_t>(KernelArgs.ArgSizes[I])
+                               : Properties.ArgSizes[I];
+        CALL_ZE_RET_ERROR(zeKernelSetArgumentValue, zeKernel, I, ArgSize, Arg);
+
+        INFO(OMP_INFOTYPE_PLUGIN_KERNEL, DeviceId,
+             "Kernel Pointer argument %" PRIu32 " (value: " DPxMOD
+             ") was set successfully for device %s.\n",
+             I, DPxPTR(Arg), IdStr);
+        Arg += ArgSize;
+      }
     }
   }
 
@@ -500,6 +573,27 @@ Error L0KernelTy::launchImpl(GenericDeviceTy &GenericDevice,
                                       Options.CommandMode);
 
   return launchKernelWithCmdQueue(l0Device, zeKernel, KEnv);
+}
+
+Expected<uint32_t>
+L0KernelTy::getMaxCooperativeGroupCount(GenericDeviceTy &GenericDevice,
+                                        const uint32_t NumThreads[3],
+                                        uint32_t DynBlockMemSize) const {
+  ze_result_t Res = zeKernelSetGroupSize(zeKernel, NumThreads[0], NumThreads[1],
+                                         NumThreads[2]);
+  if (Res != ZE_RESULT_SUCCESS)
+    return Plugin::error(ErrorCode::UNSUPPORTED,
+                         "failed to set group size for cooperative launch");
+
+  uint32_t MaxCooperativeGroupCount = 0;
+  Res = zeKernelSuggestMaxCooperativeGroupCount(zeKernel,
+                                                &MaxCooperativeGroupCount);
+
+  if (Res != ZE_RESULT_SUCCESS)
+    return Plugin::error(ErrorCode::UNSUPPORTED,
+                         "failed to query max cooperative group count");
+
+  return MaxCooperativeGroupCount;
 }
 
 } // namespace llvm::omp::target::plugin

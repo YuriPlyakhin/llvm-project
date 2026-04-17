@@ -23,6 +23,8 @@
 
 #include <OffloadAPI.h>
 
+#include <OffloadAPI.h>
+
 #include <mutex>
 #include <unordered_map>
 
@@ -46,6 +48,35 @@ _LIBSYCL_BEGIN_NAMESPACE_SYCL
 namespace detail {
 
 class DeviceImpl;
+
+/// A wrapper of liboffload program handle to manage its lifetime.
+class ProgramWrapper {
+public:
+  /// Constructs ProgramWrapper by creating liboffload program with the provided
+  /// arguments.
+  ///
+  /// \param Device is a device to use for program creation.
+  /// \param DevImage is a device image (wrapped __sycl_tgt_device_image) to use
+  /// for program creation.
+  /// \throw sycl::exception with sycl::errc::runtime when failed to create
+  /// program.
+  ProgramWrapper(ol_device_handle_t Device, DeviceImageWrapper &DevImage);
+
+  /// Releases the corresponding liboffload program handle by calling
+  /// olDestroyProgram.
+  ~ProgramWrapper();
+
+  ProgramWrapper(const ProgramWrapper &) = delete;
+  ProgramWrapper &operator=(const ProgramWrapper &) = delete;
+  ProgramWrapper(ProgramWrapper &&) = delete;
+  ProgramWrapper &operator=(ProgramWrapper &&) = delete;
+
+  /// \return the corresponding liboffload program handle.
+  ol_program_handle_t getHandle() { return MProgram; }
+
+private:
+  ol_program_handle_t MProgram{};
+};
 
 /// A class to manage programs and kernels.
 class ProgramAndKernelManager {
