@@ -42,13 +42,11 @@ checkDeviceImageValidity(const llvm::object::OffloadBinary &OB) {
 }
 
 void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
-                                              const void *BinaryEnd) {
-  assert(BinaryStart && BinaryEnd && "Binary pointers can't be nullptr");
+                                              size_t Size) {
+  assert(BinaryStart && "Binary pointer can't be nullptr");
 
   llvm::MemoryBufferRef MBR(
-      llvm::StringRef(static_cast<const char *>(BinaryStart),
-                      static_cast<const char *>(BinaryEnd) -
-                          static_cast<const char *>(BinaryStart)),
+      llvm::StringRef(static_cast<const char *>(BinaryStart), Size),
       /*Identifier=*/"");
   auto BinOrErr = llvm::object::OffloadBinary::create(MBR);
   if (!BinOrErr || BinOrErr->empty())
@@ -87,13 +85,11 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
 }
 
 void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
-                                               const void *BinaryEnd) {
-  assert(BinaryStart && BinaryEnd && "Binary pointers can't be nullptr");
+                                               size_t Size) {
+  assert(BinaryStart && "Binary pointer can't be nullptr");
 
   llvm::MemoryBufferRef MBR(
-      llvm::StringRef(static_cast<const char *>(BinaryStart),
-                      static_cast<const char *>(BinaryEnd) -
-                          static_cast<const char *>(BinaryStart)),
+      llvm::StringRef(static_cast<const char *>(BinaryStart), Size),
       /*Identifier=*/"");
   auto BinOrErr = llvm::object::OffloadBinary::create(MBR);
   if (!BinOrErr || BinOrErr->empty())
@@ -169,13 +165,13 @@ ProgramAndKernelManager::getOrCreateKernel(DeviceKernelInfo &KernelInfo,
 _LIBSYCL_END_NAMESPACE_SYCL
 
 extern "C" _LIBSYCL_EXPORT void
-__sycl_register_lib(const void *BinaryStart, const void *BinaryEnd) {
-  sycl::detail::ProgramAndKernelManager::getInstance().registerFatBin(BinaryStart,
-                                                                    BinaryEnd);
+__sycl_register_lib(const void *BinaryStart, size_t Size) {
+  sycl::detail::ProgramAndKernelManager::getInstance().registerFatBin(
+      BinaryStart, Size);
 }
 
 extern "C" _LIBSYCL_EXPORT void
-__sycl_unregister_lib(const void *BinaryStart, const void *BinaryEnd) {
+__sycl_unregister_lib(const void *BinaryStart, size_t Size) {
   sycl::detail::ProgramAndKernelManager::getInstance().unregisterFatBin(
-      BinaryStart, BinaryEnd);
+      BinaryStart, Size);
 }

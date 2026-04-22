@@ -33,17 +33,17 @@
 /// Executed as a part of a module's (.exe, .dll) static initialization.
 /// Registers device executable images with the runtime.
 /// \param BinaryStart pointer to the start of the OffloadBinary.
-/// \param BinaryEnd pointer past the end of the OffloadBinary.
+/// \param Size size in bytes of the OffloadBinary.
 extern "C" _LIBSYCL_EXPORT void __sycl_register_lib(const void *BinaryStart,
-                                                     const void *BinaryEnd);
+                                                     size_t Size);
 
 /// Executed as a part of current module's (.exe, .dll) static
 /// de-initialization.
 /// Unregisters device executable images with the runtime.
 /// \param BinaryStart pointer to the start of the OffloadBinary.
-/// \param BinaryEnd pointer past the end of the OffloadBinary.
+/// \param Size size in bytes of the OffloadBinary.
 extern "C" _LIBSYCL_EXPORT void
-__sycl_unregister_lib(const void *BinaryStart, const void *BinaryEnd);
+__sycl_unregister_lib(const void *BinaryStart, size_t Size);
 
 // +++ }
 
@@ -62,15 +62,16 @@ public:
     return PM;
   }
 
-  /// Parses the OffloadBinary at [BinaryStart, BinaryEnd) and prepares
-  /// internal structures for effective kernel/program creation.
+  /// Parses the OffloadBinary of the given Size starting at BinaryStart and
+  /// prepares internal structures for effective kernel/program creation.
   /// \throw sycl::exception with sycl::errc::runtime if parsing fails or if
   /// the binary has an incompatible kind or target.
-  void registerFatBin(const void *BinaryStart, const void *BinaryEnd);
+  void registerFatBin(const void *BinaryStart, size_t Size);
 
-  /// Removes all entries for the OffloadBinary at [BinaryStart, BinaryEnd)
-  /// from internal structures. Must match a prior call to registerFatBin.
-  void unregisterFatBin(const void *BinaryStart, const void *BinaryEnd);
+  /// Removes all entries for the OffloadBinary of the given Size starting at
+  /// BinaryStart from internal structures. Must match a prior call to
+  /// registerFatBin.
+  void unregisterFatBin(const void *BinaryStart, size_t Size);
 
   /// Creates a liboffload kernel that is ready for execution.
   /// This method is thread-safe.

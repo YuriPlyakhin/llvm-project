@@ -277,12 +277,12 @@
 
 //      SYCL: define internal void @sycl.descriptor_reg() section ".text.startup" {
 // SYCL-NEXT: entry:
-// SYCL-NEXT:   call void @__sycl_register_lib(ptr @.sycl_offloading.binary, ptr getelementptr ([[[SIZE]] x i8], ptr @.sycl_offloading.binary, i64 0, i64 [[SIZE]]))
+// SYCL-NEXT:   call void @__sycl_register_lib(ptr @.sycl_offloading.binary, i64 [[SIZE]])
 // SYCL-NEXT:   ret void
 // SYCL-NEXT: }
 
 //      SYCL: define internal void @sycl.descriptor_unreg() section ".text.startup" {
 // SYCL-NEXT: entry:
-// SYCL-NEXT:   call void @__sycl_unregister_lib(ptr @.sycl_offloading.binary, ptr getelementptr ([[[SIZE]] x i8], ptr @.sycl_offloading.binary, i64 0, i64 [[SIZE]]))
+// SYCL-NEXT:   call void @__sycl_unregister_lib(ptr @.sycl_offloading.binary, i64 [[SIZE]])
 // SYCL-NEXT:   ret void
 // SYCL-NEXT: }

@@ -632,7 +632,8 @@ public:
       : M(M), C(M.getContext()), Options(Options) {}
 
   /// Embeds \p Buffer (a raw OffloadBinary) as a global constant and returns
-  /// a pair of (Start, End) constant pointers into it.
+  /// a pair of (Start, Size), where Start points to the beginning of the
+  /// embedded data and Size is its length in bytes.
   std::pair<Constant *, Constant *> embedBinary(ArrayRef<char> Buffer) {
     Constant *Arr = ConstantDataArray::get(C, Buffer);
     GlobalVariable *BinaryGV =
@@ -647,12 +648,10 @@ public:
     Constant *Size = ConstantInt::get(Int64Ty, Buffer.size());
     Constant *Start = ConstantExpr::getGetElementPtr(
         BinaryGV->getValueType(), BinaryGV, ArrayRef<Constant *>{Zero, Zero});
-    Constant *End = ConstantExpr::getGetElementPtr(
-        BinaryGV->getValueType(), BinaryGV, ArrayRef<Constant *>{Zero, Size});
-    return {Start, End};
+    return {Start, Size};
   }
 
-  void createRegisterFatbinFunction(Constant *Start, Constant *End) {
+  void createRegisterFatbinFunction(Constant *Start, Constant *Size) {
     FunctionType *FuncTy =
         FunctionType::get(Type::getVoidTy(C), /*isVarArg*/ false);
     Function *Func = Function::Create(FuncTy, GlobalValue::InternalLinkage,
@@ -660,20 +659,21 @@ public:
     Func->setSection(".text.startup");
 
     PointerType *PtrTy = PointerType::getUnqual(C);
+    IntegerType *Int64Ty = Type::getInt64Ty(C);
     FunctionType *RegFuncTy =
-        FunctionType::get(Type::getVoidTy(C), {PtrTy, PtrTy},
+        FunctionType::get(Type::getVoidTy(C), {PtrTy, Int64Ty},
                           /*isVarArg=*/false);
     FunctionCallee RegFuncC =
         M.getOrInsertFunction("__sycl_register_lib", RegFuncTy);
 
     IRBuilder<> Builder(BasicBlock::Create(C, "entry", Func));
-    Builder.CreateCall(RegFuncC, {Start, End});
+    Builder.CreateCall(RegFuncC, {Start, Size});
     Builder.CreateRetVoid();
 
     appendToGlobalCtors(M, Func, /*Priority*/ 1);
   }
 
-  void createUnregisterFunction(Constant *Start, Constant *End) {
+  void createUnregisterFunction(Constant *Start, Constant *Size) {
     FunctionType *FuncTy =
         FunctionType::get(Type::getVoidTy(C), /*isVarArg*/ false);
     Function *Func = Function::Create(FuncTy, GlobalValue::InternalLinkage,
@@ -681,14 +681,15 @@ public:
     Func->setSection(".text.startup");
 
     PointerType *PtrTy = PointerType::getUnqual(C);
+    IntegerType *Int64Ty = Type::getInt64Ty(C);
     FunctionType *UnRegFuncTy =
-        FunctionType::get(Type::getVoidTy(C), {PtrTy, PtrTy},
+        FunctionType::get(Type::getVoidTy(C), {PtrTy, Int64Ty},
                           /*isVarArg=*/false);
     FunctionCallee UnRegFuncC =
         M.getOrInsertFunction("__sycl_unregister_lib", UnRegFuncTy);
 
     IRBuilder<> Builder(BasicBlock::Create(C, "entry", Func));
-    Builder.CreateCall(UnRegFuncC, {Start, End});
+    Builder.CreateCall(UnRegFuncC, {Start, Size});
     Builder.CreateRetVoid();
 
     appendToGlobalDtors(M, Func, /*Priority*/ 1);
@@ -744,8 +745,8 @@ Error offloading::wrapHIPBinary(Module &M, ArrayRef<char> Image,
 Error llvm::offloading::wrapSYCLBinaries(llvm::Module &M, ArrayRef<char> Buffer,
                                          SYCLJITOptions Options) {
   SYCLWrapper W(M, Options);
-  auto [Start, End] = W.embedBinary(Buffer);
-  W.createRegisterFatbinFunction(Start, End);
-  W.createUnregisterFunction(Start, End);
+  auto [Start, Size] = W.embedBinary(Buffer);
+  W.createRegisterFatbinFunction(Start, Size);
+  W.createUnregisterFunction(Start, Size);
   return Error::success();
 }
