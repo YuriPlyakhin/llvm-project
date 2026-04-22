@@ -73,7 +73,7 @@ public:
   ~DeviceImageManager() = default;
 
   /// \return a reference to the corresponding parsed OffloadBinary object.
-  const llvm::object::OffloadBinary &getRawData() const { return *MBin; }
+  const llvm::object::OffloadBinary &getOffloadBinary() const { return *MBin; }
 
   /// Returns a liboffload program which is compatible with the specified
   /// device. Searches among existing programs and creates a new one if no

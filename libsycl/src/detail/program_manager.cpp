@@ -107,7 +107,7 @@ void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
       continue;
 
     llvm::StringRef Symbols =
-        DevImageIt->second->getRawData().getString("symbols");
+        DevImageIt->second->getOffloadBinary().getString("symbols");
     const auto &Header =
         *reinterpret_cast<const llvm::offloading::sycl::SymbolTableHeader *>(
             Symbols.data());
@@ -127,7 +127,7 @@ void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
 
 static bool isImageCompatible(const DeviceImageManager &Image,
                               const DeviceImpl &Device) {
-  const llvm::object::OffloadBinary &OB = Image.getRawData();
+  const llvm::object::OffloadBinary &OB = Image.getOffloadBinary();
   if (!(OB.getTriple() == DeviceBinaryTripleSPIRV64 &&
         Device.getBackend() == sycl::backend::level_zero))
     return false;

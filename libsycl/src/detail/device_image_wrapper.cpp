@@ -17,7 +17,7 @@ ProgramWrapper::ProgramWrapper(ol_device_handle_t Device,
                                DeviceImageManager &DevImage) {
   assert(Device);
 
-  llvm::StringRef Image = DevImage.getRawData().getImage();
+  llvm::StringRef Image = DevImage.getOffloadBinary().getImage();
   callAndThrow(olCreateProgram, Device, Image.data(), Image.size(), &MProgram);
 }
 
