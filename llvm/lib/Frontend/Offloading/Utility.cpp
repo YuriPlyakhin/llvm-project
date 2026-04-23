@@ -447,6 +447,7 @@ void sycl::writeSymbolTable(ArrayRef<StringRef> Names, SmallString<0> &Out) {
   uint32_t CurrentOffset = StringDataOffset;
   for (uint32_t I = 0; I < Count; ++I) {
     Entries[I].OffsetToSymbol = CurrentOffset;
+    Entries[I].SymbolSize = Names[I].size();
     Out.append(Names[I]);
     Out.push_back('\0');
     CurrentOffset += Names[I].size() + 1;

@@ -193,6 +193,8 @@ struct SymbolTableHeader {
 };
 struct SymbolTableEntry {
   uint32_t OffsetToSymbol; ///< Byte offset from blob start to the symbol name.
+  uint32_t SymbolSize;     ///< Length of the symbol name in bytes, excluding
+                           ///< the null terminator.
 };
 
 /// Serialize \p Names into \p Out.
@@ -209,7 +211,7 @@ void forEachSymbol(StringRef Symbols, Fn &&Callback) {
   const auto *Entries =
       reinterpret_cast<const SymbolTableEntry *>(&Header + 1);
   for (uint32_t I = 0; I < Header.Count; ++I)
-    Callback(StringRef(Base + Entries[I].OffsetToSymbol));
+    Callback(StringRef(Base + Entries[I].OffsetToSymbol, Entries[I].SymbolSize));
 }
 
 } // namespace sycl
