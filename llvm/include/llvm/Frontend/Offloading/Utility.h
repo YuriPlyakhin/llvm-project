@@ -182,29 +182,24 @@ namespace sycl {
 
 /// Serialized symbol table stored in the "symbols" entry of a SYCL
 /// OffloadBinary. The in-memory layout of the blob is:
-///
 ///   [ SymbolTableHeader               ]
-///   [ SymbolTableEntry  Entries[N]    ]  -- N == Header.Count, immediately
-///                                           follows the header
+///   [ SymbolTableEntry  Entries[N]    ]  -- N == Header.Count
 ///   [ char              StringData[]  ]  -- packed null-terminated names
-///
-/// SymbolTableEntry::OffsetToSymbol is a byte offset from the blob start.
 /// Use writeSymbolTable() to produce the blob and forEachSymbol() to consume
 /// it; both encapsulate all pointer arithmetic.
+
 struct SymbolTableHeader {
   uint32_t Count; ///< Number of symbol entries.
 };
-
 struct SymbolTableEntry {
   uint32_t OffsetToSymbol; ///< Byte offset from blob start to the symbol name.
 };
 
-/// Serialize \p Names into \p Out in the SymbolTable wire format.
+/// Serialize \p Names into \p Out.
 LLVM_ABI void writeSymbolTable(ArrayRef<StringRef> Names, SmallString<0> &Out);
 
 /// Invoke \p Callback with a \c StringRef for each symbol in \p Symbols,
-/// the raw serialized symbol-table blob (typically the "symbols" string of
-/// a SYCL OffloadBinary).
+/// the raw serialized symbol-table blob.
 template <typename Fn>
 void forEachSymbol(StringRef Symbols, Fn &&Callback) {
   assert(Symbols.size() >= sizeof(SymbolTableHeader) &&
