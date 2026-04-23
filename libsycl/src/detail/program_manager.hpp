@@ -27,6 +27,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 // +++ Entry points referenced by the offload wrapper object {
 
@@ -40,10 +41,9 @@ extern "C" _LIBSYCL_EXPORT void __sycl_register_lib(const void *BinaryStart,
 /// Executed as a part of current module's (.exe, .dll) static
 /// de-initialization.
 /// Unregisters device executable images with the runtime.
-/// \param BinaryStart pointer to the start of the OffloadBinary.
-/// \param Size size in bytes of the OffloadBinary.
-extern "C" _LIBSYCL_EXPORT void
-__sycl_unregister_lib(const void *BinaryStart, size_t Size);
+/// \param BinaryStart pointer to the start of the OffloadBinary that was
+/// previously passed to __sycl_register_lib.
+extern "C" _LIBSYCL_EXPORT void __sycl_unregister_lib(const void *BinaryStart);
 
 // +++ }
 
@@ -68,10 +68,9 @@ public:
   /// the binary has an incompatible kind or target.
   void registerFatBin(const void *BinaryStart, size_t Size);
 
-  /// Removes all entries for the OffloadBinary of the given Size starting at
-  /// BinaryStart from internal structures. Must match a prior call to
-  /// registerFatBin.
-  void unregisterFatBin(const void *BinaryStart, size_t Size);
+  /// Removes all entries associated with the fat binary that was previously
+  /// passed to registerFatBin via BinaryStart.
+  void unregisterFatBin(const void *BinaryStart);
 
   /// Creates a liboffload kernel that is ready for execution.
   /// This method is thread-safe.
@@ -100,9 +99,12 @@ private:
   // by caching the pointers when possible.
   std::unordered_map<std::string_view, DeviceKernelInfo> MDeviceKernelInfoMap;
 
-  // Keyed by ImageStart address (register/unregister param); controls lifetime
-  // of device image managers and, through them, parsed OffloadBinary objects.
-  std::unordered_map<const void *, std::unique_ptr<DeviceImageManager>>
+  // Keyed by BinaryStart (register/unregister param). Each fat binary can
+  // contain multiple device images, each owned by its own DeviceImageManager.
+  // Controls lifetime of device image managers and, through them, parsed
+  // OffloadBinary objects.
+  std::unordered_map<const void *,
+                     std::vector<std::unique_ptr<DeviceImageManager>>>
       MDeviceImageManagers;
 
   // All work with device images and data related to it must be wrapped with a

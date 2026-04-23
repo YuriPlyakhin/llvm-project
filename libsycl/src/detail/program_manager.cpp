@@ -53,6 +53,9 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
     throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
                           "Failed to parse OffloadBinary");
 
+  std::vector<std::unique_ptr<DeviceImageManager>> Images;
+  Images.reserve(BinOrErr->size());
+
   std::lock_guard<std::mutex> Guard(MDataCollectionMutex);
   for (std::unique_ptr<llvm::object::OffloadBinary> &OB : *BinOrErr) {
     if (!checkDeviceImageValidity(*OB))
@@ -61,11 +64,8 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
 
     llvm::StringRef Symbols = OB->getString("symbols");
 
-    const void *ImageStart = OB->getImage().data();
-    auto [DevImgIt, Inserted] = MDeviceImageManagers.emplace(
-        ImageStart, std::make_unique<DeviceImageManager>(std::move(OB)));
-    assert(Inserted && "Device image registered twice");
-    DeviceImageManager &NewImageWrapper = *DevImgIt->second;
+    Images.push_back(std::make_unique<DeviceImageManager>(std::move(OB)));
+    DeviceImageManager &NewImageWrapper = *Images.back();
 
     llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       auto It = MDeviceKernelInfoMap.find(std::string_view(Name));
@@ -79,28 +79,22 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
       }
     });
   }
+
+  [[maybe_unused]] auto [It, Inserted] =
+      MDeviceImageManagers.emplace(BinaryStart, std::move(Images));
+  assert(Inserted && "Fat binary registered twice");
 }
 
-void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
-                                               size_t Size) {
+void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart) {
   assert(BinaryStart && "Binary pointer can't be nullptr");
 
-  llvm::MemoryBufferRef MBR(
-      llvm::StringRef(static_cast<const char *>(BinaryStart), Size),
-      /*Identifier=*/"");
-  auto BinOrErr = llvm::object::OffloadBinary::create(MBR);
-  if (!BinOrErr || BinOrErr->empty())
+  std::lock_guard<std::mutex> Guard(MDataCollectionMutex);
+  auto It = MDeviceImageManagers.find(BinaryStart);
+  if (It == MDeviceImageManagers.end())
     return;
 
-  std::lock_guard<std::mutex> Guard(MDataCollectionMutex);
-  for (std::unique_ptr<llvm::object::OffloadBinary> &OB : *BinOrErr) {
-    const void *ImageStart = OB->getImage().data();
-    auto DevImageIt = MDeviceImageManagers.find(ImageStart);
-    if (DevImageIt == MDeviceImageManagers.end())
-      continue;
-
-    llvm::StringRef Symbols =
-        DevImageIt->second->getOffloadBinary().getString("symbols");
+  for (auto &Image : It->second) {
+    llvm::StringRef Symbols = Image->getOffloadBinary().getString("symbols");
     llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       if (auto KernelIt = MDeviceKernelInfoMap.find(std::string_view(Name));
           KernelIt != MDeviceKernelInfoMap.end()) {
@@ -110,9 +104,8 @@ void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
         MDeviceKernelInfoMap.erase(KernelIt);
       }
     });
-
-    MDeviceImageManagers.erase(DevImageIt);
   }
+  MDeviceImageManagers.erase(It);
 }
 
 static bool isImageCompatible(const DeviceImageManager &Image,
@@ -165,7 +158,7 @@ __sycl_register_lib(const void *BinaryStart, size_t Size) {
 }
 
 extern "C" _LIBSYCL_EXPORT void
-__sycl_unregister_lib(const void *BinaryStart, size_t Size) {
+__sycl_unregister_lib(const void *BinaryStart) {
   sycl::detail::ProgramAndKernelManager::getInstance().unregisterFatBin(
-      BinaryStart, Size);
+      BinaryStart);
 }
