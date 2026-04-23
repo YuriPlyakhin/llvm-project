@@ -60,9 +60,6 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
                             "Incompatible device image.");
 
     llvm::StringRef Symbols = OB->getString("symbols");
-    const auto &Header =
-        *reinterpret_cast<const llvm::offloading::sycl::SymbolTableHeader *>(
-            Symbols.data());
 
     const void *ImageStart = OB->getImage().data();
     auto [DevImgIt, Inserted] = MDeviceImageManagers.emplace(
@@ -70,7 +67,7 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
     assert(Inserted && "Device image registered twice");
     DeviceImageManager &NewImageWrapper = *DevImgIt->second;
 
-    llvm::offloading::sycl::forEachSymbol(Header, [&](llvm::StringRef Name) {
+    llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       auto It = MDeviceKernelInfoMap.find(std::string_view(Name));
       if (It == MDeviceKernelInfoMap.end()) {
         [[maybe_unused]] auto [Iterator, EmplaceSucceeded] =
@@ -104,10 +101,7 @@ void ProgramAndKernelManager::unregisterFatBin(const void *BinaryStart,
 
     llvm::StringRef Symbols =
         DevImageIt->second->getOffloadBinary().getString("symbols");
-    const auto &Header =
-        *reinterpret_cast<const llvm::offloading::sycl::SymbolTableHeader *>(
-            Symbols.data());
-    llvm::offloading::sycl::forEachSymbol(Header, [&](llvm::StringRef Name) {
+    llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       if (auto KernelIt = MDeviceKernelInfoMap.find(std::string_view(Name));
           KernelIt != MDeviceKernelInfoMap.end()) {
         // Programs are attached to the image and will be released with image

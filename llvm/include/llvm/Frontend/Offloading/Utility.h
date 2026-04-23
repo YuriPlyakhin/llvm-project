@@ -202,12 +202,17 @@ struct SymbolTableEntry {
 /// Serialize \p Names into \p Out in the SymbolTable wire format.
 LLVM_ABI void writeSymbolTable(ArrayRef<StringRef> Names, SmallString<0> &Out);
 
-/// Invoke \p Callback with a \c StringRef for each symbol in the table.
+/// Invoke \p Callback with a \c StringRef for each symbol in \p Symbols,
+/// the raw serialized symbol-table blob (typically the "symbols" string of
+/// a SYCL OffloadBinary).
 template <typename Fn>
-void forEachSymbol(const SymbolTableHeader &Header, Fn &&Callback) {
+void forEachSymbol(StringRef Symbols, Fn &&Callback) {
+  assert(Symbols.size() >= sizeof(SymbolTableHeader) &&
+         "symbols blob smaller than header");
+  const char *Base = Symbols.data();
+  const auto &Header = *reinterpret_cast<const SymbolTableHeader *>(Base);
   const auto *Entries =
       reinterpret_cast<const SymbolTableEntry *>(&Header + 1);
-  const char *Base = reinterpret_cast<const char *>(&Header);
   for (uint32_t I = 0; I < Header.Count; ++I)
     Callback(StringRef(Base + Entries[I].OffsetToSymbol));
 }
