@@ -499,6 +499,8 @@ static SmallString<0> collectSymbols(const Module &M) {
   for (const Function &F : M)
     if (isEntryPoint(F))
       KernelNames.push_back(F.getName());
+  if (KernelNames.empty())
+    return {};
   SmallString<0> SymbolData;
   llvm::offloading::sycl::writeSymbolTable(KernelNames, SymbolData);
   return SymbolData;

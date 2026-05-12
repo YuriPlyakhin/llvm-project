@@ -93,6 +93,12 @@
 // SPLIT-KERNEL-NEXT: LLVM backend: input: [[SPLIT0]].bc, output: {{.*}}_0.spv
 // SPLIT-KERNEL-NEXT: LLVM backend: input: [[SPLIT1]].bc, output: {{.*}}_1.spv
 //
+// Test that a module with no kernel entry points produces no offloading image.
+// RUN: llvm-as %S/Inputs/SYCL/no-kernels.ll -o %t-no-kernels.bc
+// RUN: clang-sycl-linker -triple=spirv64 %t-no-kernels.bc -o %t-no-kernels.out
+// RUN: llvm-objdump --offloading %t-no-kernels.out | FileCheck %s --check-prefix=NO-KERNELS
+// NO-KERNELS-NOT: kind
+//
 // Test that an invalid split mode is rejected.
 // RUN: not clang-sycl-linker --dry-run -triple=spirv64 --module-split-mode=bogus %t_1.bc -o a.out 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=SPLIT-INVALID
