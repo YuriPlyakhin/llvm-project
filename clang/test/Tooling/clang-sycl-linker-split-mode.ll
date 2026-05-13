@@ -17,7 +17,7 @@
 ; SPLIT-NONE-NOT:  {{.+}}
 ;
 ; Test the split mode ("kernel"): each SPIR_KERNEL function produces its own device image.
-; RUN: clang-sycl-linker --dry-run -v -triple=spirv64 --module-split-mode=kernel %t.bc -o %t-kernel.out 2>&1 \
+; RUN: clang-sycl-linker --dry-run -v -triple=spirv64 --module-split-mode=kernel %t.bc -o %t-split-kernel.out 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=SPLIT-KERNEL
 ; SPLIT-KERNEL:      sycl-device-link: inputs: {{.*}}.bc  libfiles:  output: [[LLVMLINKOUT:.*]].bc
 ; SPLIT-KERNEL-NEXT: sycl-module-split: input: [[LLVMLINKOUT]].bc, mode: kernel
