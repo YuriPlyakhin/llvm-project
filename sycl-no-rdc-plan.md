@@ -340,6 +340,44 @@ RDC and no-RDC.
   and the CIR mirrors (`CIRGenModule.cpp`, `CIRGenCUDANV.cpp`,
   `LoweringPrepare.cpp`) if/when SYCL uses the CIR path.
 
+## Implementation as independent PRs
+
+The feature splits into **4 PRs**, each ≤~150 LOC. Key idea: the customer-facing
+switch (`-f[no-]sycl-rdc`) is also the *activation* switch — until the driver has
+both the alias and the `BuildOffloadingActions` no-rdc branch, no-rdc is
+unreachable. So all enabling machinery lands **dormant/internal** first (PRs
+A–C), and the final PR D adds the user-facing flags and wiring that turn it on.
+
+| PR | Scope | ~LOC | Depends on | Customer-facing? |
+|---|---|---|---|---|
+| **A. Device linkage + `-fgpu-rdc` injection** | §5 SYCL block in `getLLVMLinkageForDeclarator` **and** (unified) inject `-fgpu-rdc` on the SYCL device `-cc1` line by default. Bundled because the linkage block reads `GPURelocatableDeviceCode`; the injection makes default SYCL langopt=true → `LinkOnceODR` (preserves RDC). | ~120 | — | No (internal cc1 flag + codegen) |
+| **B. Host registration** | §3 host side: `-fsycl-include-target-binary` (internal), `SYCLTargetBinaryFileName` in CodeGenOptions, `CGSYCLRuntime` hook calling shared `wrapSYCLBinaries`. Dormant (nothing passes the flag yet). | ~150 | — | No (internal) |
+| **C. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path. Dormant (no action graph invokes it yet). | ~80 | — | No (internal) |
+| **D. Activation (last)** | `-f[no-]sycl-rdc` **aliases** (§1); `SYCLNoRDC` no-rdc branch in `BuildOffloadingActions` (§2); make the `-fgpu-rdc` injection conditional (omit in no-rdc); wire the finalized image to host `-fsycl-include-target-binary`; phases test. | ~150 | A, B, C | **Yes — all user-facing surface** |
+
+Dependency DAG (A, B, C fully parallel; D integrates last):
+```
+PR A ─┐
+PR B ─┼──► PR D
+PR C ─┘
+```
+
+Notes:
+- **A is the one behavior-changing PR.** It changes existing RDC SYCL linkage
+  (non-exported device symbols: external/weak_odr → `linkonce_odr`) and may
+  require updating existing `CodeGenSYCL` lit tests. This is the intended target
+  state (matches intel/llvm) and preserves RDC cross-TU semantics, but it is a
+  real change to today's output — isolate it so reviewers can scrutinize it.
+- **The `-fgpu-rdc` injection is unified into A (per design), not a separate
+  step**, because the linkage block is incorrect without it (default SYCL would
+  internalize everything). D only *narrows* the injection (omit it in no-rdc).
+- **C avoids dead code:** implement the finalize as an extension of the existing
+  `clang-sycl-linker`/`SPIRV.cpp` linker path with its own lit test driving it
+  directly, so behavior is reviewed even before D references it.
+- All of A–C are safe to land in any order among themselves: `-fgpu-rdc` is
+  passed for SYCL only after A, and all 17 `GPURelocatableDeviceCode` read-sites
+  are CUDA/HIP-gated, so none fire for SYCL until A's own block.
+
 ## Files to modify
 
 - `clang/include/clang/Options/Options.td` — add `fsycl_rdc`/`fno_sycl_rdc`
