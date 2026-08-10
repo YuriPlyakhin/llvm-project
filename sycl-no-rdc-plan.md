@@ -62,9 +62,10 @@ registration.
   `-fsycl-include-target-binary` alongside `-fcuda-include-gpubinary`, the
   existing CUDA option is generalized to `-foffload-include-binary` and shared
   (§0). Raised in review of the intel/llvm counterpart (intel/llvm#22833).
-- **`-flto` is rejected for a `clang-sycl-linker` finalize link** rather than
-  silently routed to `llvm-lto`, which would emit bitcode where a finalized
-  device image is expected (§3).
+- **`-flto` does not divert the per-TU finalize link.** `-flto` on a SYCL
+  command line is a *host* LTO request; the device finalize link must keep
+  using `clang-sycl-linker` rather than being routed to `llvm-lto`, which would
+  emit bitcode where a finalized device image is expected (§3).
 
 ## Current flow references
 
@@ -258,14 +259,22 @@ The driver must also supply the device target triple and arch (`-triple=`,
 offloading job, so the tool can tag the image correctly. The RDC route forwards
 these via `-Xlinker`, so already-forwarded values must not be duplicated.
 
-**`-flto` is diagnosed, not silently mis-routed.** `SPIRV::Linker::ConstructJob`
-checks `isUsingLTO` *before* deciding on `clang-sycl-linker`, so `-flto` would
-substitute `llvm-lto` and emit LLVM bitcode into `.sycl_fatbin` with exit code 0
-— a finalized-image slot silently holding un-finalized bitcode. The
-`clang-sycl-linker` predicate is therefore computed **before** the LTO check and
-the existing `err_drv_no_linker_llvm_support` diagnostic is emitted for that
-case, the same diagnostic used when LTO is unsupported outright. This also fixes
-`--sycl-link -flto`, which had the same latent bug independently of no-rdc.
+**`-flto` must not divert the finalize link.** `SPIRV::Linker::ConstructJob`
+checks `isUsingLTO` *before* deciding on `clang-sycl-linker`, so a bare `-flto`
+would substitute `llvm-lto` and emit LLVM bitcode into the finalized-image slot
+with exit code 0. Note `isUsingLTO(Args)` with no offload kind queries
+`-f[no-]lto`, i.e. **host** LTO (`-foffload-lto` is the device-side spelling),
+and device code reaching this link is already bitcode — so `-flto` is not a
+request to change the device linker at all. The per-TU finalize path therefore
+takes priority over the LTO check, leaving `-flto` to act on the host as it does
+in RDC mode: `-fsycl -fno-sycl-rdc -flto -c` finalizes via `clang-sycl-linker`
+and the host object is LTO bitcode carrying the registration IR.
+
+This deliberately does **not** change `--sycl-link -flto`, which errors with
+`err_drv_no_linker_llvm_support` on `main` already — that behaviour is
+pre-existing and intentional (added by #182347 and asserted by
+`clang/test/Driver/spirv-lto.c`), since `--sycl-link` is an explicit request for
+a device-only link where a host LTO flag has no meaning.
 
 **Host inclusion uses the shared `-foffload-include-binary`** (§0) — no new
 SYCL-specific option:
@@ -434,7 +443,7 @@ A–D), and the final PR E adds the user-facing flags and wiring that turn it on
 | **A. Device linkage + `-fgpu-rdc` injection** | §5 SYCL block in `getLLVMLinkageForDeclarator` **and** (unified) inject `-fgpu-rdc` on the SYCL device `-cc1` line by default. Bundled because the linkage block reads `GPURelocatableDeviceCode`; the injection makes default SYCL langopt=true → `LinkOnceODR` (preserves RDC). | ~120 | — | No (internal cc1 flag + codegen) |
 | **B. `-foffload-include-binary` (NFC)** | §0: rename `-fcuda-include-gpubinary` → `-foffload-include-binary` (keeping the old spelling as an `Alias<>`), `CudaGpuBinaryFileName` → `OffloadBinaryToEmbedFile`. Pure refactor, no SYCL code. | ~40 | — | No (cc1-only rename, old spelling still accepted) |
 | **C. Host registration** | §3 host side: `embedSYCLTargetBinary` in `CodeGenSYCL.cpp` honoring `-foffload-include-binary` for `SYCLIsHost`, calling shared `wrapSYCLBinaries`, plus the §4 `IsFinalizedImage`/`.sycl_fatbin` section split in `OffloadWrapper.cpp`. Dormant (nothing passes the flag for SYCL yet). | ~130 | B | No (internal) |
-| **D. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path (`-triple=`/`-arch=` derivation, `-flto` diagnostic). Dormant (no action graph invokes it yet). | ~90 | — | No (internal; the `-flto` fix does change `--sycl-link -flto` from silent bitcode to an error) |
+| **D. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path (`-triple=`/`-arch=` derivation). Dormant (no action graph invokes it yet). | ~60 | — | No (internal; purely additive over `main`) |
 | **E. Activation (last)** | `-f[no-]sycl-rdc` **aliases** (§1); `SYCLNoRDC` no-rdc branch in `BuildOffloadingActions` (§2); make the `-fgpu-rdc` injection conditional (omit in no-rdc); wire the finalized image to host `-foffload-include-binary`; phases + section tests. | ~150 | A, C, D | **Yes — all user-facing surface** |
 
 Dependency DAG (A, B→C, D parallel; E integrates last):
@@ -499,8 +508,8 @@ Notes:
 - `clang/lib/Driver/ToolChains/SPIRV.cpp` — §3 device side: route a SYCL
   device-offloading link to `clang-sycl-linker`, derive `-triple=`/`-arch=` from
   the offloading job (skipping values already forwarded via `-Xlinker`), and
-  diagnose `-flto` with `err_drv_no_linker_llvm_support` instead of falling
-  through to `llvm-lto`.
+  and, in PR E, give the per-TU finalize path priority over the `isUsingLTO`
+  check so a host `-flto` does not divert it to `llvm-lto`.
 - `clang/lib/Driver/ToolChains/SYCL.{h,cpp}` — give `SYCLToolChain` a device
   linker (reusing the SPIR-V toolchain's `clang-sycl-linker` path) and native
   LLVM bitcode support, so the per-TU finalize link can consume device bitcode.
@@ -533,11 +542,12 @@ Notes:
     option appearing earlier on the command line. (Raised in review of
     intel/llvm#22833.)
   - final `clang-linker-wrapper` performs no SYCL device link in no-rdc.
-- **`-flto` rejection**: assert `-fsycl -fno-sycl-rdc -flto` (with and without
-  `-c`) errors with `unable to pass LLVM bit-code files to linker` and never
-  invokes `llvm-lto`; likewise for `--sycl-link -flto` in
-  `sycl-link-spirv-target.cpp`. Without this the driver exits 0 having written
-  LLVM bitcode into `.sycl_fatbin`.
+- **`-flto` non-interference**: assert `-fsycl -fno-sycl-rdc -flto` (with and
+  without `-c`) still finalizes via `clang-sycl-linker` and still passes
+  `-foffload-include-binary`, with `--implicit-check-not=llvm-lto`. Without this
+  the driver exits 0 having written LLVM bitcode into the finalized-image slot.
+  `spirv-lto.c` on `main` already covers the complementary cases (plain
+  `-flto` → `llvm-lto`, `--sycl-link -flto` → error) and must keep passing.
 - **Linkage** (`clang/test/CodeGenSYCL/...`): device-codegen test asserting, for
   a non-exported device helper function:
   - `-fno-sycl-rdc` → `internal` linkage;
@@ -601,7 +611,7 @@ from its review that apply upstream, and where each is handled:
 
 | Point | Disposition |
 |---|---|
-| `-flto` silently routes a `clang-sycl-linker` finalize link to `llvm-lto`, writing bitcode where a device image is expected | Fixed in §3 / PR D. Reproduced upstream: `-fsycl -fno-sycl-rdc -flto -c` exited 0 with `BC C0 DE` in `.sycl_fatbin`. Also fixed the same latent bug on `--sycl-link -flto`. |
+| `-flto` silently routes a `clang-sycl-linker` finalize link to `llvm-lto`, writing bitcode where a device image is expected | Fixed in §3 / PR E. Reproduced upstream: `-fsycl -fno-sycl-rdc -flto -c` exited 0 with `BC C0 DE` in `.sycl_fatbin`. Fixed by giving the finalize path priority over the LTO check, so host `-flto` behaves as in RDC mode. `--sycl-link -flto` keeps its pre-existing `main` behaviour (an error). |
 | Detect the `clang-sycl-linker` route precisely | §3: use `JA.isDeviceOffloading(OFK_SYCL)` rather than a broader `isOffloading` query (PR E, where that arm is added), and compute the predicate before the LTO check so LTO can be diagnosed (PR D). |
 | A trailing `CHECK-NOT` does not prove absence across the whole command line | §Verification: converted to `--implicit-check-not=` in both SYCL driver tests. |
 | Don't add a SYCL-specific option duplicating `-fcuda-include-gpubinary` | §0 / PR B: generalized to the shared `-foffload-include-binary`; both preconditions (no mixed offloading, single-valued) verified. |
@@ -620,12 +630,13 @@ user-facing spelling to deprecate), and upstream **deletes**
 `-fsycl-include-target-binary` outright rather than aliasing it, since that
 option never shipped upstream and has no invocations to keep working.
 
-**Known gap versus intel/llvm.** Their tests assert that
-`-fno-sycl-rdc -flto -c` *succeeds*; upstream currently rejects `-flto` on a
-finalize link (`err_drv_no_linker_llvm_support`, §3). Rejecting is the correct
-interim behaviour — the alternative observed upstream was exit 0 with bitcode in
-`.sycl_fatbin` — but making LTO actually work on the per-TU finalize path is a
-follow-up beyond this stack.
+**`-flto` converges with intel/llvm.** Their tests assert that
+`-fno-sycl-rdc -flto -c` succeeds; upstream now matches, for a different reason.
+Their finalize route (`clang-linker-wrapper --sycl-device-link`) never consults
+`ToolChain::isUsingLTO`, so `-flto` is inert on it by construction. Upstream
+finalizes through `SPIRV::Linker`, which *does* consult it, so the finalize path
+is given priority over the LTO check explicitly (§3). Both trees end up treating
+`-flto` as a host-only request on a no-rdc compile.
 
 Points from that review that do **not** apply upstream (different code base):
 the `SYCL_EXTERNAL` diagnostic discussion (upstream carves it out rather than
