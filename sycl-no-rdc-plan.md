@@ -115,7 +115,7 @@ option and let all three models use it:
   the CUDA block. `-fcuda-include-gpubinary` is kept as a plain `Alias<>` so
   existing invocations and the ~19 CUDA/HIP CodeGen tests that pass it keep
   working unchanged.
-- `CodeGenOptions::CudaGpuBinaryFileName` → `OffloadBinaryToEmbed`.
+- `CodeGenOptions::CudaGpuBinaryFileName` → `OffloadBinaryToEmbedFile`.
 - All push sites in `Clang.cpp` emit the new spelling; read sites
   (`CGCUDANV.cpp`, `CIRGenModule.cpp`, `DeviceOffload.cpp`) use the new field.
 
@@ -273,10 +273,10 @@ SYCL-specific option:
   **host** SYCL `-cc1` line, in the same `Clang.cpp` block CUDA/HIP use
   (`Clang.cpp:8306-8313`). (RDC keeps `-fembed-offload-object`; the two are
   mutually exclusive per TU.)
-- The filename lands in `CodeGenOptions::OffloadBinaryToEmbed`.
+- The filename lands in `CodeGenOptions::OffloadBinaryToEmbedFile`.
 
 **Host-CodeGen registration via the shared wrapper.** In host SYCL compilation,
-when `OffloadBinaryToEmbed` is set, read the file and call the **shared**
+when `OffloadBinaryToEmbedFile` is set, read the file and call the **shared**
 `llvm::offloading::wrapSYCLBinaries(CGM.getModule(), Buffer, Options)`
 (`OffloadWrapper.cpp:751`) to embed the image + emit the `__sycl_register_lib`
 ctor / `__sycl_unregister_lib` dtor directly into the host module.
@@ -287,7 +287,7 @@ ctor / `__sycl_unregister_lib` dtor directly into the host module.
   registration), SYCL host CodeGen *calls* the shared `wrapSYCLBinaries`. Add a
   minimal hook — `CodeGenModule::embedSYCLTargetBinary()`, invoked from
   `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:1166-1170`),
-  gated on `LangOpts.SYCLIsHost && !OffloadBinaryToEmbed.empty()`. The hook is
+  gated on `LangOpts.SYCLIsHost && !OffloadBinaryToEmbedFile.empty()`. The hook is
   thin glue (read file → call shared wrapper); all IR-emitting logic stays in
   `OffloadWrapper.cpp`.
 - **The hook body lives in `CodeGenSYCL.cpp`, not `CodeGenModule.cpp`.** Only the
@@ -432,7 +432,7 @@ A–D), and the final PR E adds the user-facing flags and wiring that turn it on
 | PR | Scope | ~LOC | Depends on | Customer-facing? |
 |---|---|---|---|---|
 | **A. Device linkage + `-fgpu-rdc` injection** | §5 SYCL block in `getLLVMLinkageForDeclarator` **and** (unified) inject `-fgpu-rdc` on the SYCL device `-cc1` line by default. Bundled because the linkage block reads `GPURelocatableDeviceCode`; the injection makes default SYCL langopt=true → `LinkOnceODR` (preserves RDC). | ~120 | — | No (internal cc1 flag + codegen) |
-| **B. `-foffload-include-binary` (NFC)** | §0: rename `-fcuda-include-gpubinary` → `-foffload-include-binary` (keeping the old spelling as an `Alias<>`), `CudaGpuBinaryFileName` → `OffloadBinaryToEmbed`. Pure refactor, no SYCL code. | ~40 | — | No (cc1-only rename, old spelling still accepted) |
+| **B. `-foffload-include-binary` (NFC)** | §0: rename `-fcuda-include-gpubinary` → `-foffload-include-binary` (keeping the old spelling as an `Alias<>`), `CudaGpuBinaryFileName` → `OffloadBinaryToEmbedFile`. Pure refactor, no SYCL code. | ~40 | — | No (cc1-only rename, old spelling still accepted) |
 | **C. Host registration** | §3 host side: `embedSYCLTargetBinary` in `CodeGenSYCL.cpp` honoring `-foffload-include-binary` for `SYCLIsHost`, calling shared `wrapSYCLBinaries`, plus the §4 `IsFinalizedImage`/`.sycl_fatbin` section split in `OffloadWrapper.cpp`. Dormant (nothing passes the flag for SYCL yet). | ~130 | B | No (internal) |
 | **D. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path (`-triple=`/`-arch=` derivation, `-flto` diagnostic). Dormant (no action graph invokes it yet). | ~90 | — | No (internal; the `-flto` fix does change `--sycl-link -flto` from silent bitcode to an error) |
 | **E. Activation (last)** | `-f[no-]sycl-rdc` **aliases** (§1); `SYCLNoRDC` no-rdc branch in `BuildOffloadingActions` (§2); make the `-fgpu-rdc` injection conditional (omit in no-rdc); wire the finalized image to host `-foffload-include-binary`; phases + section tests. | ~150 | A, C, D | **Yes — all user-facing surface** |
@@ -477,15 +477,15 @@ Notes:
   the host SYCL `-cc1` in no-rdc, as a new arm of the existing CUDA/HIP block
   (~8306-8317). (No internalize `-mllvm` flag — see §5.)
 - `clang/include/clang/Options/Options.td` — §0: `-foffload-include-binary`
-  (`Separate`, `MarshallingInfoString<CodeGenOpts<"OffloadBinaryToEmbed">>`)
+  (`Separate`, `MarshallingInfoString<CodeGenOpts<"OffloadBinaryToEmbedFile">>`)
   next to `fembed_offload_object_EQ`; `fcuda_include_gpubinary` becomes an
   `Alias<>` of it.
 - `clang/include/clang/Basic/CodeGenOptions.h` — §0: rename
-  `CudaGpuBinaryFileName` → `OffloadBinaryToEmbed` (~391).
+  `CudaGpuBinaryFileName` → `OffloadBinaryToEmbedFile` (~398).
 - `clang/lib/CodeGen/CGCUDANV.cpp`, `clang/lib/CIR/CodeGen/CIRGenModule.cpp`,
   `clang/lib/Interpreter/DeviceOffload.cpp` — §0: read the renamed field.
 - `clang/lib/CodeGen/CodeGenSYCL.cpp` — `CodeGenModule::embedSYCLTargetBinary()`:
-  read the file named by `OffloadBinaryToEmbed` and call shared
+  read the file named by `OffloadBinaryToEmbedFile` and call shared
   `offloading::wrapSYCLBinaries(getModule(), ..., /*IsFinalizedImage=*/true)`.
   Declared in `CodeGenModule.h`; the gated one-line call goes in
   `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:~1169`).
@@ -608,6 +608,25 @@ from its review that apply upstream, and where each is handled:
 | Keep SYCL-specific logic out of common CodeGen | §3 / PR C: `embedSYCLTargetBinary` body lives in `CodeGenSYCL.cpp`; only the gated call remains in `CodeGenModule::Release`. |
 | Trim over-explanatory comments | Applied across the implementation; comments state the contract, not the narrative. |
 
+**Convergence.** intel/llvm#22833 independently landed the same unification
+after the same review discussion, choosing `-foffload-include-binary` (identical
+option spelling) with the field named `OffloadBinaryFileName`. Upstream uses
+`OffloadBinaryToEmbedFile`, which follows the `…File` suffix convention that
+dominates `clang/include/clang/Basic/` and keeps the "binary *to embed*" role
+explicit next to the neighbouring `-fembed-offload-object=` list. Two other
+deliberate divergences: upstream keeps `-fcuda-include-gpubinary` as a bare
+`Alias<>` without "Deprecated alias" `HelpText` (it is cc1-only, so there is no
+user-facing spelling to deprecate), and upstream **deletes**
+`-fsycl-include-target-binary` outright rather than aliasing it, since that
+option never shipped upstream and has no invocations to keep working.
+
+**Known gap versus intel/llvm.** Their tests assert that
+`-fno-sycl-rdc -flto -c` *succeeds*; upstream currently rejects `-flto` on a
+finalize link (`err_drv_no_linker_llvm_support`, §3). Rejecting is the correct
+interim behaviour — the alternative observed upstream was exit 0 with bitcode in
+`.sycl_fatbin` — but making LTO actually work on the per-TU finalize path is a
+follow-up beyond this stack.
+
 Points from that review that do **not** apply upstream (different code base):
 the `SYCL_EXTERNAL` diagnostic discussion (upstream carves it out rather than
 diagnosing, §5), `llvm-foreach`/old-offload-model plumbing, downstream-only
@@ -628,7 +647,7 @@ reimplementing registration in CodeGen.
 | 2. Self-containment (front-end linkage) | `StrongODR`→internal, `CUDAGlobalAttr` kernels external — `CodeGenModule.cpp:6730-6733` | same — `CodeGenModule.cpp:6730-6733` | new SYCL block: non-exported device symbols → `Internal` (no-RDC) / `LinkOnceODR` (RDC); carve out `SYCLKernelAttr`+`SYCLExternalAttr` — `CodeGenModule.cpp:~6737` (§5) |
 | 3. Device finalize (per TU) | assemble PTX → fatbin: `LinkJobAction(TY_CUDA_FATBIN)` — `Driver.cpp:5190-5191` | link → fatbin via `LinkerWrapperJobAction(TY_HIP_FATBIN)` — `Driver.cpp:5220-5221` | `clang-sycl-linker` finalizes → device image: per-TU finalize action — `Driver.cpp:~5194` (§2) |
 | 4. Pass image to host compile | `-foffload-include-binary <fatbin>` — `Clang.cpp:8306-8308` | `-foffload-include-binary <fatbin>` — `Clang.cpp:8310-8313` | **same option** `-foffload-include-binary <image>` — `Clang.cpp:8314-8320` (§0, §3) |
-| 5. Store filename in CodeGenOpts | `OffloadBinaryToEmbed` — `Options.td` (next to `fembed_offload_object_EQ`), `CodeGenOptions.h:391` | same | same (§0) |
+| 5. Store filename in CodeGenOpts | `OffloadBinaryToEmbedFile` — `Options.td` (next to `fembed_offload_object_EQ`), `CodeGenOptions.h:398` | same | same (§0) |
 | 6. Host compile: embed image | `CGCUDANV` reads file → `.nv_fatbin` section — `CGCUDANV.cpp:858-868,895+` | reads file → `.hip_fatbin` — `CGCUDANV.cpp:898-916` | call shared `offloading::wrapSYCLBinaries` → `.sycl_offloading.binary` global in `.sycl_fatbin` section — `OffloadWrapper.cpp:751` + thin host hook (§3) |
 | 7. Host compile: emit registration | `CGNVCUDARuntime` builds register ctor (reimplemented) — `CGCUDANV.cpp:828,1443` | HIP register ctor (reimplemented) | `__sycl_register_lib` ctor + `__sycl_unregister_lib` dtor via shared `SYCLWrapper` — `OffloadWrapper.cpp:660-702` |
 | 8. Hook ctor into module | `CodeGenModule::Release` → `CUDARuntime->finalizeModule()` → `AddGlobalCtor` — `CodeGenModule.cpp:1163-1167` | same | gated one-line call next to it (`CodeGenModule.cpp:1169`); body in `CodeGenSYCL.cpp` (§3) |
