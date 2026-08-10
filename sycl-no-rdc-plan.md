@@ -23,11 +23,11 @@ Goal:
 - `-fno-sycl-rdc`: **exact mirror of the CUDA/HIP no-rdc structure.** Each SYCL
   TU device-links (finalizes) independently via a per-TU `clang-sycl-linker`
   invocation; the finalized device image is included into that TU's host
-  compilation via a new `-fsycl-include-target-binary` (analog of
-  `-fcuda-include-gpubinary`), where host CodeGen embeds + registers it **at
-  compile time** by calling the shared `offloading::wrapSYCLBinaries`. The final
-  `clang-linker-wrapper` then finds no SYCL device code to link and does **no
-  device work** — there is no second device-link/wrap step.
+  compilation via `-foffload-include-binary` (the generalization of
+  `-fcuda-include-gpubinary` — see §0), where host CodeGen embeds + registers it
+  **at compile time** by calling the shared `offloading::wrapSYCLBinaries`. The
+  final `clang-linker-wrapper` then finds no SYCL device code to link and does
+  **no device work** — there is no second device-link/wrap step.
 
 This is the CUDA/HIP RDC-vs-no-RDC split applied to SYCL: RDC registers at link
 (the image only exists after cross-TU device link); no-RDC registers at compile
@@ -36,7 +36,8 @@ This is the CUDA/HIP RDC-vs-no-RDC split applied to SYCL: RDC registers at link
 than CGCUDANV, which reimplements registration).
 
 Reference model: **CUDA** `-fno-gpu-rdc` — per-TU device finalize + host-compile
-inclusion via `-fcuda-include-gpubinary`, so the final link does no device work.
+inclusion via `-fcuda-include-gpubinary` (renamed to `-foffload-include-binary`,
+§0), so the final link does no device work.
 (CUDA branch in `BuildOffloadingActions` at `Driver.cpp:5186-5193`; host include
 at `Clang.cpp:8273-8275`; compile-time registration in `CGCUDANV`.) SYCL mirrors
 this but *calls* the shared `wrapSYCLBinaries` instead of reimplementing
@@ -47,7 +48,7 @@ registration.
 - **Action graph**: per-TU `LinkerWrapperJobAction` (HIP-style).
 - **Per-TU finalize + compile-time registration** (exact CUDA/HIP mirror):
   `clang-sycl-linker` is invoked per-TU to *finalize* each TU's device image to
-  a file; host CodeGen includes it via `-fsycl-include-target-binary` and calls the
+  a file; host CodeGen includes it via `-foffload-include-binary` and calls the
   shared `offloading::wrapSYCLBinaries` to embed + register at compile time. The
   final `clang-linker-wrapper` does **no** SYCL device work (no second
   device-link/wrap). Registration code stays shared in `OffloadWrapper.cpp`;
@@ -57,6 +58,13 @@ registration.
   (matching intel/llvm), reusing the existing `GPURelocatableDeviceCode`
   LangOpt. No new LangOpt/marshalling. SYCL's RDC-by-default is enforced by the
   driver (see §1/§2), since the underlying `-fgpu-rdc` LangOpt is `DefaultFalse`.
+- **No new SYCL-specific cc1 option for host inclusion.** Rather than adding
+  `-fsycl-include-target-binary` alongside `-fcuda-include-gpubinary`, the
+  existing CUDA option is generalized to `-foffload-include-binary` and shared
+  (§0). Raised in review of the intel/llvm counterpart (intel/llvm#22833).
+- **`-flto` is rejected for a `clang-sycl-linker` finalize link** rather than
+  silently routed to `llvm-lto`, which would emit bitcode where a finalized
+  device image is expected (§3).
 
 ## Current flow references
 
@@ -67,9 +75,14 @@ registration.
   - HIP no-rdc per-TU wrapper branch: `Driver.cpp:5202-5224`
     (`OffloadPackagerJobAction` → per-TU `LinkerWrapperJobAction(AL, TY_HIP_FATBIN)`).
   - Generic SYCL (RDC) branch today: `Driver.cpp:5225-5232`.
+(Locations in this section are as they stand **before** this work; §0 renames
+`-fcuda-include-gpubinary`/`CudaGpuBinaryFileName`.)
+
 - Host embedding today (RDC): `-fembed-offload-object` —
   `clang/lib/Driver/ToolChains/Clang.cpp:8282-8284`. CUDA/HIP no-rdc instead use
   `-fcuda-include-gpubinary` (`Clang.cpp:8273-8275`) — the model §3 mirrors.
+  Note CUDA and HIP already **share** that option, which is the precedent for
+  generalizing rather than duplicating it (§0).
 - CUDA/HIP no-rdc host-compile registration (the reference for §3):
   `-fcuda-include-gpubinary` → `CodeGenOpts.CudaGpuBinaryFileName`
   (`Options.td:8977-8979`, `CodeGenOptions.h:383`) → `CGCUDANV.cpp:832,858`
@@ -86,6 +99,44 @@ registration.
   `bundleSYCL` (`792-803`), `wrapSYCLBinaries` wrap (`748-755`).
 
 ## Implementation
+
+### 0. Generalize `-fcuda-include-gpubinary` → `-foffload-include-binary` (NFC)
+
+The cc1 option that names a finalized device binary to incorporate into the host
+object at compile time is not CUDA-specific — it is the generic "device code was
+finalized per TU, embed it here instead of deferring to a device link" channel,
+and CUDA and HIP already **share** it (`Clang.cpp:8306`:
+`if ((IsCuda || IsHIP) && ...)`). SYCL no-rdc needs exactly the same channel, so
+rather than adding a parallel `-fsycl-include-target-binary`, rename the existing
+option and let all three models use it:
+
+- `-fcuda-include-gpubinary` → `-foffload-include-binary`, placed next to
+  `-fembed-offload-object=` (its device-link-deferred counterpart) rather than in
+  the CUDA block. `-fcuda-include-gpubinary` is kept as a plain `Alias<>` so
+  existing invocations and the ~19 CUDA/HIP CodeGen tests that pass it keep
+  working unchanged.
+- `CodeGenOptions::CudaGpuBinaryFileName` → `OffloadBinaryToEmbed`.
+- All push sites in `Clang.cpp` emit the new spelling; read sites
+  (`CGCUDANV.cpp`, `CIRGenModule.cpp`, `DeviceOffload.cpp`) use the new field.
+
+Two preconditions were verified empirically, both required for a *single*
+shared option to be sufficient:
+1. **Offloading kinds cannot be mixed on one command line** —
+   `err_drv_mix_offload` (`Driver.cpp:1071`) rejects e.g. `-fsycl -x cuda`, so
+   there is never a need to include a CUDA binary and a SYCL binary in the same
+   host compile. The offloading model already in effect (`-fcuda-is-device`,
+   `-fsycl-is-host`, ...) unambiguously selects how the named binary is
+   incorporated, so the option needs no per-model spelling.
+2. **The option is legitimately single-valued.** It is `Separate<>` with
+   `MarshallingInfoString` (a repeat overwrites, unlike the
+   `MarshallingInfoStringVector` used by `-fembed-offload-object=`). This is
+   correct by construction: `Driver.cpp:5227` builds **one** `LinkJobAction`
+   over all `OffloadActions`, so a single finalized binary covers every
+   requested arch (multi-target is handled *inside* the file), and
+   `HostOffloadingInputs` is asserted to be size 1 at every include site.
+
+This is NFC and lands as its own PR **before** the SYCL host-registration PR
+(see the PR table). Suggested by review of intel/llvm#22833.
 
 ### 1. Options (alias to `-fgpu-rdc`)
 
@@ -161,7 +212,7 @@ CUDA/HIP behavior.
   ```cpp
   } else if (SYCLNoRDC) {
     // Finalize this TU's device image (clang-sycl-linker). Result is a device
-    // image FILE that host CodeGen will include via -fsycl-include-target-binary.
+    // image FILE that host CodeGen will include via -foffload-include-binary.
     Action *FinalizeAction =
         C.MakeAction<LinkJobAction>(OffloadActions, types::TY_Image);
     DDep.add(*FinalizeAction, *C.getSingleOffloadToolChain<Action::OFK_SYCL>(),
@@ -172,8 +223,8 @@ CUDA/HIP behavior.
   ```
   Because `BuildOffloadingActions` runs once per TU, this yields one finalized
   device image per TU. It is consumed by the host compile (§3) via
-  `-fsycl-include-target-binary` (analogous to how CUDA's per-TU fatbin is consumed
-  via `-fcuda-include-gpubinary`, `Clang.cpp:8273-8275`), **not** via
+  `-foffload-include-binary` — the very same option CUDA's per-TU fatbin uses
+  (`Clang.cpp:8306-8313`, §0) — **not** via
   `-fembed-offload-object`. (Exact `LinkJobAction` vs a dedicated finalize
   action type is an implementation detail; the point is: device-only finalize,
   no host-side linker-wrapper node.)
@@ -202,21 +253,30 @@ reuses the existing `--sycl-link` path (`ClangLinkerWrapper.cpp:596-608` is the
 *RDC* route; here the driver calls `clang-sycl-linker` directly for the per-TU
 job, or a device-only linker-wrapper mode that stops after `linkDevice`).
 
-**New option `-fsycl-include-target-binary`** (analog of `-fcuda-include-gpubinary`,
-`Options.td:8977-8979`):
-```
-def fsycl_include_target_binary : Separate<["-"], "fsycl-include-target-binary">,
-  HelpText<"Incorporate SYCL device-side binary into host object file.">,
-  MarshallingInfoString<CodeGenOpts<"SYCLTargetBinaryFileName">>;
-```
-- Add `std::string SYCLTargetBinaryFileName;` to `CodeGenOptions.h` (next to
-  `CudaGpuBinaryFileName` at `CodeGenOptions.h:383`).
-- Driver: in no-rdc, pass `-fsycl-include-target-binary <finalized-image>` on the
-  **host** SYCL `-cc1` line, mirroring the CUDA path at `Clang.cpp:8273-8275`.
-  (RDC keeps `-fembed-offload-object`; the two are mutually exclusive per TU.)
+The driver must also supply the device target triple and arch (`-triple=`,
+`-arch=`) when it invokes `clang-sycl-linker` directly, deriving them from the
+offloading job, so the tool can tag the image correctly. The RDC route forwards
+these via `-Xlinker`, so already-forwarded values must not be duplicated.
+
+**`-flto` is diagnosed, not silently mis-routed.** `SPIRV::Linker::ConstructJob`
+checks `isUsingLTO` *before* deciding on `clang-sycl-linker`, so `-flto` would
+substitute `llvm-lto` and emit LLVM bitcode into `.sycl_fatbin` with exit code 0
+— a finalized-image slot silently holding un-finalized bitcode. The
+`clang-sycl-linker` predicate is therefore computed **before** the LTO check and
+the existing `err_drv_no_linker_llvm_support` diagnostic is emitted for that
+case, the same diagnostic used when LTO is unsupported outright. This also fixes
+`--sycl-link -flto`, which had the same latent bug independently of no-rdc.
+
+**Host inclusion uses the shared `-foffload-include-binary`** (§0) — no new
+SYCL-specific option:
+- Driver: in no-rdc, pass `-foffload-include-binary <finalized-image>` on the
+  **host** SYCL `-cc1` line, in the same `Clang.cpp` block CUDA/HIP use
+  (`Clang.cpp:8306-8313`). (RDC keeps `-fembed-offload-object`; the two are
+  mutually exclusive per TU.)
+- The filename lands in `CodeGenOptions::OffloadBinaryToEmbed`.
 
 **Host-CodeGen registration via the shared wrapper.** In host SYCL compilation,
-when `SYCLTargetBinaryFileName` is set, read the file and call the **shared**
+when `OffloadBinaryToEmbed` is set, read the file and call the **shared**
 `llvm::offloading::wrapSYCLBinaries(CGM.getModule(), Buffer, Options)`
 (`OffloadWrapper.cpp:751`) to embed the image + emit the `__sycl_register_lib`
 ctor / `__sycl_unregister_lib` dtor directly into the host module.
@@ -225,11 +285,15 @@ ctor / `__sycl_unregister_lib` dtor directly into the host module.
   `llvm::offloading::` helpers (`CGCUDANV.cpp:24,1279`).
 - **Reuse over reimplementation:** unlike `CGCUDANV` (which *reimplements*
   registration), SYCL host CodeGen *calls* the shared `wrapSYCLBinaries`. Add a
-  minimal hook — e.g. a `CGSYCLRuntime::finalizeModule()` invoked from
-  `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:1108-1111`),
-  gated on `LangOpts.SYCLIsHost && !SYCLTargetBinaryFileName.empty()`. The hook is
-  thin glue (read file → call shared wrapper → `AddGlobalCtor`); all IR-emitting
-  logic stays in `OffloadWrapper.cpp`.
+  minimal hook — `CodeGenModule::embedSYCLTargetBinary()`, invoked from
+  `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:1166-1170`),
+  gated on `LangOpts.SYCLIsHost && !OffloadBinaryToEmbed.empty()`. The hook is
+  thin glue (read file → call shared wrapper); all IR-emitting logic stays in
+  `OffloadWrapper.cpp`.
+- **The hook body lives in `CodeGenSYCL.cpp`, not `CodeGenModule.cpp`.** Only the
+  one-line gated call sits in `Release()`; SYCL-specific logic belongs in the
+  SYCL CodeGen file so the common module does not accumulate per-offload-model
+  code. (Raised in review of intel/llvm#22833.)
 
 **Why this is the CUDA/HIP mirror (and why no second wrapper call):** CUDA/HIP
 no-rdc finalize the device image first, then host CodeGen embeds+registers it at
@@ -265,9 +329,9 @@ CUDA/HIP, which keep compile-time-embedded fatbins in `.nv_fatbin`/`.hip_fatbin`
 (`OffloadWrapper.cpp:293-305`) precisely so the wrapper never re-consumes them.
 Unlike CUDA there is no second `.nvFatBinSegment`-style section, since SYCL
 passes `(ptr, size)` straight to `__sycl_register_lib` and has no wrapper
-descriptor to place. This change lives in **PR B** (it touches the shared
-`llvm/lib/Frontend/Offloading/OffloadWrapper.cpp`), making B a prerequisite for
-PR D working end to end.
+descriptor to place. This change lives in **PR C** (it touches the shared
+`llvm/lib/Frontend/Offloading/OffloadWrapper.cpp`), making C a prerequisite for
+PR E working end to end.
 
 **Registration is per-TU, never aggregated across TUs** — matching every other
 model's no-rdc path. Each host `.o` emits its own single-blob registration
@@ -359,27 +423,31 @@ RDC and no-RDC.
 
 ## Implementation as independent PRs
 
-The feature splits into **4 PRs**, each ≤~150 LOC. Key idea: the customer-facing
+The feature splits into **5 PRs**, each ≤~170 LOC. Key idea: the customer-facing
 switch (`-f[no-]sycl-rdc`) is also the *activation* switch — until the driver has
 both the alias and the `BuildOffloadingActions` no-rdc branch, no-rdc is
 unreachable. So all enabling machinery lands **dormant/internal** first (PRs
-A–C), and the final PR D adds the user-facing flags and wiring that turn it on.
+A–D), and the final PR E adds the user-facing flags and wiring that turn it on.
 
 | PR | Scope | ~LOC | Depends on | Customer-facing? |
 |---|---|---|---|---|
 | **A. Device linkage + `-fgpu-rdc` injection** | §5 SYCL block in `getLLVMLinkageForDeclarator` **and** (unified) inject `-fgpu-rdc` on the SYCL device `-cc1` line by default. Bundled because the linkage block reads `GPURelocatableDeviceCode`; the injection makes default SYCL langopt=true → `LinkOnceODR` (preserves RDC). | ~120 | — | No (internal cc1 flag + codegen) |
-| **B. Host registration** | §3 host side: `-fsycl-include-target-binary` (internal), `SYCLTargetBinaryFileName` in CodeGenOptions, `CGSYCLRuntime` hook calling shared `wrapSYCLBinaries`, plus the §4 `IsFinalizedImage`/`.sycl_fatbin` section split in `OffloadWrapper.cpp`. Dormant (nothing passes the flag yet). | ~170 | — | No (internal) |
-| **C. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path. Dormant (no action graph invokes it yet). | ~80 | — | No (internal) |
-| **D. Activation (last)** | `-f[no-]sycl-rdc` **aliases** (§1); `SYCLNoRDC` no-rdc branch in `BuildOffloadingActions` (§2); make the `-fgpu-rdc` injection conditional (omit in no-rdc); wire the finalized image to host `-fsycl-include-target-binary`; phases test. | ~150 | A, B, C | **Yes — all user-facing surface** |
+| **B. `-foffload-include-binary` (NFC)** | §0: rename `-fcuda-include-gpubinary` → `-foffload-include-binary` (keeping the old spelling as an `Alias<>`), `CudaGpuBinaryFileName` → `OffloadBinaryToEmbed`. Pure refactor, no SYCL code. | ~40 | — | No (cc1-only rename, old spelling still accepted) |
+| **C. Host registration** | §3 host side: `embedSYCLTargetBinary` in `CodeGenSYCL.cpp` honoring `-foffload-include-binary` for `SYCLIsHost`, calling shared `wrapSYCLBinaries`, plus the §4 `IsFinalizedImage`/`.sycl_fatbin` section split in `OffloadWrapper.cpp`. Dormant (nothing passes the flag for SYCL yet). | ~130 | B | No (internal) |
+| **D. Device finalize** | §3 device side: per-TU `clang-sycl-linker` finalize path (`-triple=`/`-arch=` derivation, `-flto` diagnostic). Dormant (no action graph invokes it yet). | ~90 | — | No (internal; the `-flto` fix does change `--sycl-link -flto` from silent bitcode to an error) |
+| **E. Activation (last)** | `-f[no-]sycl-rdc` **aliases** (§1); `SYCLNoRDC` no-rdc branch in `BuildOffloadingActions` (§2); make the `-fgpu-rdc` injection conditional (omit in no-rdc); wire the finalized image to host `-foffload-include-binary`; phases + section tests. | ~150 | A, C, D | **Yes — all user-facing surface** |
 
-Dependency DAG (A, B, C fully parallel; D integrates last):
+Dependency DAG (A, B→C, D parallel; E integrates last):
 ```
-PR A ─┐
-PR B ─┼──► PR D
-PR C ─┘
+PR A ──────┐
+PR B ─► C ─┼──► PR E
+PR D ──────┘
 ```
 
 Notes:
+- **B is a prerequisite of C only** (C reads the renamed option/field). B is NFC
+  and independently landable — it is worth review on its own merits since it
+  removes a CUDA-specific name from a mechanism CUDA, HIP, and now SYCL share.
 - **A is the one behavior-changing PR.** It changes existing RDC SYCL linkage
   (non-exported device symbols: external/weak_odr → `linkonce_odr`) and may
   require updating existing `CodeGenSYCL` lit tests. This is the intended target
@@ -387,13 +455,14 @@ Notes:
   real change to today's output — isolate it so reviewers can scrutinize it.
 - **The `-fgpu-rdc` injection is unified into A (per design), not a separate
   step**, because the linkage block is incorrect without it (default SYCL would
-  internalize everything). D only *narrows* the injection (omit it in no-rdc).
-- **C avoids dead code:** implement the finalize as an extension of the existing
+  internalize everything). E only *narrows* the injection (omit it in no-rdc).
+- **D avoids dead code:** implement the finalize as an extension of the existing
   `clang-sycl-linker`/`SPIRV.cpp` linker path with its own lit test driving it
-  directly, so behavior is reviewed even before D references it.
-- All of A–C are safe to land in any order among themselves: `-fgpu-rdc` is
-  passed for SYCL only after A, and all 17 `GPURelocatableDeviceCode` read-sites
-  are CUDA/HIP-gated, so none fire for SYCL until A's own block.
+  directly (via `--sycl-link`), so behavior is reviewed even before E references
+  it.
+- All of A–D are safe to land in any order (subject to B before C): `-fgpu-rdc`
+  is passed for SYCL only after A, and all 17 `GPURelocatableDeviceCode`
+  read-sites are CUDA/HIP-gated, so none fire for SYCL until A's own block.
 
 ## Files to modify
 
@@ -404,25 +473,37 @@ Notes:
   no-rdc branch in `BuildOffloadingActions` (~5016, ~5225): per-TU device
   finalize action (mirror CUDA branch `5186-5193`).
 - `clang/lib/Driver/ToolChains/Clang.cpp` — inject `-fgpu-rdc` on SYCL device
-  cc1 by default (~5308); pass `-fsycl-include-target-binary <finalized-image>` on
-  the host SYCL `-cc1` in no-rdc (mirror CUDA at ~8273-8275). (No internalize
-  `-mllvm` flag — see §5.)
-- `clang/include/clang/Options/Options.td` — add `-fsycl-include-target-binary`
-  (`Separate`, `MarshallingInfoString<CodeGenOpts<"SYCLTargetBinaryFileName">>`),
-  mirroring `fcuda_include_gpubinary` (`8977-8979`).
-- `clang/include/clang/Basic/CodeGenOptions.h` — add `SYCLTargetBinaryFileName`
-  (next to `CudaGpuBinaryFileName`, ~383).
-- `clang/lib/CodeGen/` — new thin `CGSYCLRuntime` (or equivalent host hook):
-  when `SYCLTargetBinaryFileName` is set, read the file and call shared
-  `offloading::wrapSYCLBinaries(getModule(), ...)`, `AddGlobalCtor`. Invoke from
-  `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:1108-1111`),
-  gated on `LangOpts.SYCLIsHost`. No registration logic reimplemented.
+  cc1 by default (~5308); pass `-foffload-include-binary <finalized-image>` on
+  the host SYCL `-cc1` in no-rdc, as a new arm of the existing CUDA/HIP block
+  (~8306-8317). (No internalize `-mllvm` flag — see §5.)
+- `clang/include/clang/Options/Options.td` — §0: `-foffload-include-binary`
+  (`Separate`, `MarshallingInfoString<CodeGenOpts<"OffloadBinaryToEmbed">>`)
+  next to `fembed_offload_object_EQ`; `fcuda_include_gpubinary` becomes an
+  `Alias<>` of it.
+- `clang/include/clang/Basic/CodeGenOptions.h` — §0: rename
+  `CudaGpuBinaryFileName` → `OffloadBinaryToEmbed` (~391).
+- `clang/lib/CodeGen/CGCUDANV.cpp`, `clang/lib/CIR/CodeGen/CIRGenModule.cpp`,
+  `clang/lib/Interpreter/DeviceOffload.cpp` — §0: read the renamed field.
+- `clang/lib/CodeGen/CodeGenSYCL.cpp` — `CodeGenModule::embedSYCLTargetBinary()`:
+  read the file named by `OffloadBinaryToEmbed` and call shared
+  `offloading::wrapSYCLBinaries(getModule(), ..., /*IsFinalizedImage=*/true)`.
+  Declared in `CodeGenModule.h`; the gated one-line call goes in
+  `CodeGenModule::Release` next to the CUDA hook (`CodeGenModule.cpp:~1169`).
+  No registration logic reimplemented, and no SYCL logic in `CodeGenModule.cpp`.
 - `clang/lib/CodeGen/CodeGenModule.cpp` — add a SYCL-device block in
   `getLLVMLinkageForDeclarator` (before the generic C++ tail ~6737), gated on
   `SYCLIsDevice`, carving out `SYCLKernelAttr`/`SYCLExternalAttr` (upstream's
   available subset); non-exported device symbols → `LinkOnceODR` (RDC) /
   `Internal` (no-RDC). See §5. (No `SemaSYCL.cpp` / diagnostic changes —
   `SYCL_EXTERNAL` is carved out, not rejected, matching intel/llvm.)
+- `clang/lib/Driver/ToolChains/SPIRV.cpp` — §3 device side: route a SYCL
+  device-offloading link to `clang-sycl-linker`, derive `-triple=`/`-arch=` from
+  the offloading job (skipping values already forwarded via `-Xlinker`), and
+  diagnose `-flto` with `err_drv_no_linker_llvm_support` instead of falling
+  through to `llvm-lto`.
+- `clang/lib/Driver/ToolChains/SYCL.{h,cpp}` — give `SYCLToolChain` a device
+  linker (reusing the SPIR-V toolchain's `clang-sycl-linker` path) and native
+  LLVM bitcode support, so the per-TU finalize link can consume device bitcode.
 - `clang-linker-wrapper`: **no changes for no-rdc** (final wrapper sees no SYCL
   device input). Only if the per-TU finalize is implemented as a device-only
   linker-wrapper mode (vs a direct `clang-sycl-linker` driver job) would a small
@@ -442,13 +523,21 @@ Notes:
   feeding the host compile; **no** device-side `clang-linker-wrapper` node) and
   an explicit `-fsycl-rdc` block confirming today's phases are unchanged
   (default == RDC).
-- **New test** `clang/test/Driver/sycl-offload-nordc.cpp` (`-###`):
-  - no-rdc: host SYCL `-cc1` receives `-fsycl-include-target-binary <img>`;
-    `-fembed-offload-object` is **absent**; per-TU `clang-sycl-linker` is
-    invoked to finalize;
-  - rdc/default: `-fembed-offload-object` present, no
-    `-fsycl-include-target-binary`;
+- **Driver `-###`** (in `sycl-offload-jit.cpp`):
+  - no-rdc: host SYCL `-cc1` receives `-foffload-include-binary`, and
+    `clang-sycl-linker` is invoked per TU with `-triple=`/`-arch=`;
+  - rdc/default: `-fembed-offload-object=` present;
+  - each direction asserts the *absence* of the other's option with
+    `--implicit-check-not=`, not a trailing `-NOT` — a trailing `CHECK-NOT` only
+    covers the region after the last positive match, so it would not catch the
+    option appearing earlier on the command line. (Raised in review of
+    intel/llvm#22833.)
   - final `clang-linker-wrapper` performs no SYCL device link in no-rdc.
+- **`-flto` rejection**: assert `-fsycl -fno-sycl-rdc -flto` (with and without
+  `-c`) errors with `unable to pass LLVM bit-code files to linker` and never
+  invokes `llvm-lto`; likewise for `--sycl-link -flto` in
+  `sycl-link-spirv-target.cpp`. Without this the driver exits 0 having written
+  LLVM bitcode into `.sycl_fatbin`.
 - **Linkage** (`clang/test/CodeGenSYCL/...`): device-codegen test asserting, for
   a non-exported device helper function:
   - `-fno-sycl-rdc` → `internal` linkage;
@@ -464,12 +553,15 @@ Notes:
   emits `-fgpu-rdc` (RDC default), while `-fno-sycl-rdc` omits it.
 - **Build & run**:
   ```
-  ninja -C build clang clang-linker-wrapper
-  ./build/bin/llvm-lit -v clang/test/Driver/sycl-offload-jit.cpp \
-      clang/test/Driver/sycl-offload-nordc.cpp
+  ninja -C build clang clang-sycl-linker clang-linker-wrapper
+  ./build/bin/llvm-lit -v clang/test/Driver clang/test/CodeGenSYCL \
+      clang/test/CodeGenCUDA clang/test/CodeGenHIP
   ```
-- **Registration codegen** (`clang/test/CodeGenSYCL/...`): with
-  `-fsycl-include-target-binary <file>` on the host `-cc1`, assert the host module
+  (CUDA/HIP CodeGen tests are included because §0 touches their option; they pass
+  unchanged through the `-fcuda-include-gpubinary` alias, while the CUDA/HIP
+  *driver* tests that check the emitted spelling are updated.)
+- **Registration codegen** (`clang/test/CodeGenSYCL/offload-include-binary.cpp`):
+  with `-foffload-include-binary <file>` on the host `-cc1`, assert the host module
   contains the embedded `.sycl_offloading.binary` global and a
   `__sycl_register_lib` ctor (i.e. the shared `wrapSYCLBinaries` ran at compile
   time), **in section `.sycl_fatbin` and not `.llvm.offloading`** (§4).
@@ -502,6 +594,26 @@ split mode is `SPLIT_PER_TU` in **both** modes, so the rdc-vs-no-rdc difference
 is in the number of OffloadBinary blobs and `__sycl_register_lib` calls, not in
 the split granularity.
 
+## Review feedback from intel/llvm#22833
+
+intel/llvm#22833 implements no-rdc downstream, inspired by this design. Points
+from its review that apply upstream, and where each is handled:
+
+| Point | Disposition |
+|---|---|
+| `-flto` silently routes a `clang-sycl-linker` finalize link to `llvm-lto`, writing bitcode where a device image is expected | Fixed in §3 / PR D. Reproduced upstream: `-fsycl -fno-sycl-rdc -flto -c` exited 0 with `BC C0 DE` in `.sycl_fatbin`. Also fixed the same latent bug on `--sycl-link -flto`. |
+| Detect the `clang-sycl-linker` route precisely | §3: use `JA.isDeviceOffloading(OFK_SYCL)` rather than a broader `isOffloading` query (PR E, where that arm is added), and compute the predicate before the LTO check so LTO can be diagnosed (PR D). |
+| A trailing `CHECK-NOT` does not prove absence across the whole command line | §Verification: converted to `--implicit-check-not=` in both SYCL driver tests. |
+| Don't add a SYCL-specific option duplicating `-fcuda-include-gpubinary` | §0 / PR B: generalized to the shared `-foffload-include-binary`; both preconditions (no mixed offloading, single-valued) verified. |
+| Keep SYCL-specific logic out of common CodeGen | §3 / PR C: `embedSYCLTargetBinary` body lives in `CodeGenSYCL.cpp`; only the gated call remains in `CodeGenModule::Release`. |
+| Trim over-explanatory comments | Applied across the implementation; comments state the contract, not the narrative. |
+
+Points from that review that do **not** apply upstream (different code base):
+the `SYCL_EXTERNAL` diagnostic discussion (upstream carves it out rather than
+diagnosing, §5), `llvm-foreach`/old-offload-model plumbing, downstream-only
+driver options, `sycl-post-link` staging, and DPC++-specific device-library
+handling.
+
 ## Appendix: no-RDC flow — CUDA vs HIP vs designed SYCL
 
 Step-by-step comparison of the non-relocatable-device-code flow, with source
@@ -515,11 +627,11 @@ reimplementing registration in CodeGen.
 | 1. Device compile (per TU/arch) | `-fcuda-is-device` → PTX/obj | `-fcuda-is-device` → obj/bc | `-fsycl-is-device -emit-llvm-bc` → device bitcode |
 | 2. Self-containment (front-end linkage) | `StrongODR`→internal, `CUDAGlobalAttr` kernels external — `CodeGenModule.cpp:6730-6733` | same — `CodeGenModule.cpp:6730-6733` | new SYCL block: non-exported device symbols → `Internal` (no-RDC) / `LinkOnceODR` (RDC); carve out `SYCLKernelAttr`+`SYCLExternalAttr` — `CodeGenModule.cpp:~6737` (§5) |
 | 3. Device finalize (per TU) | assemble PTX → fatbin: `LinkJobAction(TY_CUDA_FATBIN)` — `Driver.cpp:5190-5191` | link → fatbin via `LinkerWrapperJobAction(TY_HIP_FATBIN)` — `Driver.cpp:5220-5221` | `clang-sycl-linker` finalizes → device image: per-TU finalize action — `Driver.cpp:~5194` (§2) |
-| 4. Pass image to host compile | `-fcuda-include-gpubinary <fatbin>` — `Clang.cpp:8273-8275` | `-fcuda-include-gpubinary <fatbin>` — `Clang.cpp:8277-8280` | new `-fsycl-include-target-binary <image>` — `Clang.cpp:~8273` (§3) |
-| 5. Store filename in CodeGenOpts | `CudaGpuBinaryFileName` — `Options.td:8977-8979`, `CodeGenOptions.h:383` | same | new `SYCLTargetBinaryFileName` — Options.td + `CodeGenOptions.h` (§3) |
+| 4. Pass image to host compile | `-foffload-include-binary <fatbin>` — `Clang.cpp:8306-8308` | `-foffload-include-binary <fatbin>` — `Clang.cpp:8310-8313` | **same option** `-foffload-include-binary <image>` — `Clang.cpp:8314-8320` (§0, §3) |
+| 5. Store filename in CodeGenOpts | `OffloadBinaryToEmbed` — `Options.td` (next to `fembed_offload_object_EQ`), `CodeGenOptions.h:391` | same | same (§0) |
 | 6. Host compile: embed image | `CGCUDANV` reads file → `.nv_fatbin` section — `CGCUDANV.cpp:858-868,895+` | reads file → `.hip_fatbin` — `CGCUDANV.cpp:898-916` | call shared `offloading::wrapSYCLBinaries` → `.sycl_offloading.binary` global in `.sycl_fatbin` section — `OffloadWrapper.cpp:751` + thin host hook (§3) |
 | 7. Host compile: emit registration | `CGNVCUDARuntime` builds register ctor (reimplemented) — `CGCUDANV.cpp:828,1443` | HIP register ctor (reimplemented) | `__sycl_register_lib` ctor + `__sycl_unregister_lib` dtor via shared `SYCLWrapper` — `OffloadWrapper.cpp:660-702` |
-| 8. Hook ctor into module | `CodeGenModule::Release` → `CUDARuntime->finalizeModule()` → `AddGlobalCtor` — `CodeGenModule.cpp:1108-1111` | same | new SYCL hook next to it — `CodeGenModule.cpp:~1111` (§3) |
+| 8. Hook ctor into module | `CodeGenModule::Release` → `CUDARuntime->finalizeModule()` → `AddGlobalCtor` — `CodeGenModule.cpp:1163-1167` | same | gated one-line call next to it (`CodeGenModule.cpp:1169`); body in `CodeGenSYCL.cpp` (§3) |
 | 9. Final link (`clang-linker-wrapper`) | runs; `getDeviceInput` finds nothing → no device work, plain host link | same | same — no clang-linker-wrapper changes (§4) |
 
 Notes:
@@ -539,8 +651,9 @@ Notes:
   because `clang-sycl-linker` **already emits a single packed blob per TU**
   (`ClangLinkerWrapper.cpp:796-797`: "clang-sycl-linker packs outputs into one
   binary blob") — so no `clang-linker-wrapper` layer is needed at finalize, and
-  exactly one blob per TU is handed to `-fsycl-include-target-binary`. The images
-  packed are always within one TU; cross-TU merging happens only in RDC.
+  exactly one blob per TU is handed to `-foffload-include-binary`. The images
+  packed are always within one TU; cross-TU merging happens only in RDC. This is
+  also why `-foffload-include-binary` can be single-valued (§0).
 - Step 2: SYCL adopts intel/llvm's linkage block (`CodeGenModule.cpp:7345-7356`),
   carving out `SYCLKernelAttr` + `SYCLExternalAttr` (upstream's available subset;
   intel/llvm also excludes `SYCLDeviceAttr`/`device_global`, which upstream
