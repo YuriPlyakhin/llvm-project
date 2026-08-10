@@ -5106,6 +5106,12 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
       C.isOffloadingHostKind(Action::OFK_HIP) &&
       !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false);
 
+  // Unlike CUDA/HIP, SYCL defaults to relocatable device code.
+  bool SYCLNoRDC =
+      C.isOffloadingHostKind(Action::OFK_SYCL) &&
+      !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc,
+                    /*Default=*/true);
+
   bool HIPRelocatableObj =
       C.isOffloadingHostKind(Action::OFK_HIP) &&
       Args.hasFlag(options::OPT_fhip_emit_relocatable,
@@ -5318,6 +5324,22 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
     DDep.add(*PackagerAction,
              *C.getOffloadToolChains<Action::OFK_HIP>().first->second,
              /*BA=*/{}, Action::OFK_HIP);
+  } else if (SYCLNoRDC) {
+    // Package all the offloading actions into a single output that can be
+    // embedded in the host and linked.
+    Action *PackagerAction =
+        C.MakeAction<OffloadPackagerJobAction>(OffloadActions, types::TY_Image);
+
+    // Finalize this translation unit's device code now instead of deferring it
+    // to a cross-TU device link, and emit the fat binary the host compilation
+    // embeds and registers via -foffload-include-binary. Do not bind a
+    // specific architecture here, as the packaged image may contain entries
+    // for several of them.
+    ActionList AL{PackagerAction};
+    PackagerAction =
+        C.MakeAction<LinkerWrapperJobAction>(AL, types::TY_SYCL_FATBIN);
+    DDep.add(*PackagerAction, *C.getSingleOffloadToolChain<Action::OFK_SYCL>(),
+             /*BA=*/{}, Action::OFK_SYCL);
   } else {
     // Package all the offloading actions into a single output that can be
     // embedded in the host and linked.

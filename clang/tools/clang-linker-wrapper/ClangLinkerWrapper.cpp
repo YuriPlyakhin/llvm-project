@@ -923,17 +923,51 @@ bundleOpenMP(ArrayRef<OffloadingImage> Images) {
   return std::move(Buffers);
 }
 
+/// Merges the finalized SYCL device images into one offloading binary.
+///
+/// Every input is already an offloading binary rather than a bare image:
+/// clang-sycl-linker finalizes one architecture per invocation and packs the
+/// images it produced for it, one per device code module, into a binary of its
+/// own. The runtime reads a single header, so simply handing those binaries on
+/// would make it see only whichever one came first. Unpack them and write all
+/// of their entries, which already carry the architecture each was built for,
+/// back out under one header.
 Expected<SmallVector<std::unique_ptr<MemoryBuffer>>>
 bundleSYCL(ArrayRef<OffloadingImage> Images) {
   SmallVector<std::unique_ptr<MemoryBuffer>> Buffers;
-  for (const OffloadingImage &Image : Images) {
-    // clang-sycl-linker packs outputs into one binary blob. Therefore, it is
-    // passed to Offload Wrapper as is.
-    StringRef S(Image.Image->getBufferStart(), Image.Image->getBufferSize());
+
+  // A dry run never ran the device links, so there is nothing to unpack. Hand
+  // on the placeholder the first of them reported, so that the commands the
+  // dry run goes on to print still name a file.
+  if (DryRun) {
     Buffers.emplace_back(
-        MemoryBuffer::getMemBufferCopy(S, Image.Image->getBufferIdentifier()));
+        MemoryBuffer::getMemBuffer(Images.front().Image->getMemBufferRef(),
+                                   /*RequiresNullTerminator=*/false));
+    return std::move(Buffers);
   }
 
+  SmallVector<OffloadingImage> Entries;
+  for (const OffloadingImage &Image : Images) {
+    auto BinariesOrErr = OffloadBinary::create(Image.Image->getMemBufferRef());
+    if (!BinariesOrErr)
+      return BinariesOrErr.takeError();
+    for (const std::unique_ptr<OffloadBinary> &Binary : *BinariesOrErr) {
+      OffloadingImage &Entry = Entries.emplace_back();
+      Entry.TheImageKind = Binary->getImageKind();
+      Entry.TheOffloadKind = Binary->getOffloadKind();
+      Entry.Flags = Binary->getFlags();
+      // The keys and values, like the image itself, point into the buffer the
+      // caller owns, so they outlive the binary they were read through.
+      for (const auto &[Key, Value] : Binary->strings())
+        Entry.StringData[Key] = Value;
+      Entry.Image = MemoryBuffer::getMemBuffer(
+          Binary->getImage(), Image.Image->getBufferIdentifier(),
+          /*RequiresNullTerminator=*/false);
+    }
+  }
+
+  Buffers.emplace_back(
+      MemoryBuffer::getMemBufferCopy(OffloadBinary::write(Entries)));
   return std::move(Buffers);
 }
 

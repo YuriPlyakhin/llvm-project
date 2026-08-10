@@ -16,6 +16,8 @@
 
 #include <llvm/Frontend/Offloading/Utility.h>
 
+#include <unordered_set>
+
 _LIBSYCL_BEGIN_NAMESPACE_SYCL
 namespace detail {
 
@@ -38,8 +40,14 @@ void ProgramAndKernelManager::releaseResources() {
 
 static inline bool
 checkDeviceImageValidity(const llvm::object::OffloadBinary &OB) {
-  return (OB.getOffloadKind() == llvm::object::OFK_SYCL) &&
-         (OB.getImageKind() == llvm::object::IMG_SPIRV);
+  if (OB.getOffloadKind() != llvm::object::OFK_SYCL)
+    return false;
+  // A fat binary holds an image per architecture its device code was built for.
+  // Those built ahead of time are device binaries, the rest is SPIR-V to be
+  // compiled at run time. Whether an image can be used on a given device is
+  // decided per device, see isImageCompatible().
+  return OB.getImageKind() == llvm::object::IMG_SPIRV ||
+         OB.getImageKind() == llvm::object::IMG_Object;
 }
 
 void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
@@ -60,6 +68,11 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
   DeviceImageManagerVec Images;
   Images.reserve(BinOrErr->size());
 
+  // The kernels this binary is the first to offer. A kernel of a fat binary
+  // registered earlier is left with the images of that binary, so that all the
+  // images a kernel can be built from belong to one binary and go away with it.
+  std::unordered_set<std::string_view> KernelsOfThisBinary;
+
   std::lock_guard<std::mutex> Guard(MDataCollectionMutex);
   for (std::unique_ptr<llvm::object::OffloadBinary> &OB : *BinOrErr) {
     if (!checkDeviceImageValidity(*OB))
@@ -74,12 +87,18 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
     llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       auto It = MDeviceKernelInfoMap.find(std::string_view(Name));
       if (It == MDeviceKernelInfoMap.end()) {
-        [[maybe_unused]] auto [Iterator, EmplaceSucceeded] =
-            MDeviceKernelInfoMap.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(std::string_view(Name)),
-                std::forward_as_tuple(std::string_view(Name), NewImageWrapper));
-        assert(EmplaceSucceeded && "Kernel name found in multiple images");
+        MDeviceKernelInfoMap.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::string_view(Name)),
+            std::forward_as_tuple(std::string_view(Name), NewImageWrapper));
+        KernelsOfThisBinary.insert(std::string_view(Name));
+      } else if (KernelsOfThisBinary.count(std::string_view(Name))) {
+        // Several images of one fat binary can export the same kernel, because
+        // the binary holds an image per architecture the kernel was built for,
+        // and the device code of an architecture can be split into several
+        // images. Record every one of them as a candidate; the device the
+        // kernel is launched on is what decides between them.
+        It->second.addDeviceImage(NewImageWrapper);
       }
     });
   }
@@ -120,11 +139,33 @@ static bool isImageCompatible(const DeviceImageManager &Image,
         Device.getBackend() == sycl::backend::level_zero))
     return false;
 
+  // This is also what rules out an image built ahead of time for an
+  // architecture other than this device's, as such an image is a device binary
+  // the device it was not built for does not accept.
   bool IsValid{};
   llvm::StringRef ImageBytes = OB.getImage();
   callAndThrow(olIsValidBinary, Device.getOLHandle(), ImageBytes.data(),
                ImageBytes.size(), &IsValid);
   return IsValid;
+}
+
+/// Picks the image to build a kernel from out of the images offering it.
+///
+/// An image built ahead of time for this very device is preferred over SPIR-V
+/// that would have to be compiled for it at run time, so device binaries are
+/// considered first.
+static DeviceImageManager *selectDeviceImage(const DeviceKernelInfo &KernelInfo,
+                                             const DeviceImpl &Device) {
+  DeviceImageManager *SPIRVImage = nullptr;
+  for (DeviceImageManager *Image : KernelInfo.getDeviceImages()) {
+    if (!isImageCompatible(*Image, Device))
+      continue;
+    if (Image->getOffloadBinary().getImageKind() != llvm::object::IMG_SPIRV)
+      return Image;
+    if (!SPIRVImage)
+      SPIRVImage = Image;
+  }
+  return SPIRVImage;
 }
 
 ol_symbol_handle_t
@@ -136,15 +177,15 @@ ProgramAndKernelManager::getOrCreateKernel(DeviceKernelInfo &KernelInfo,
   if (auto Kernel = KernelInfo.getKernel(Device.getOLHandle()))
     return Kernel;
 
-  auto &DeviceImage = KernelInfo.getDeviceImage();
+  DeviceImageManager *DeviceImage = selectDeviceImage(KernelInfo, Device);
 
-  if (!isImageCompatible(DeviceImage, Device))
+  if (!DeviceImage)
     throw exception(make_error_code(errc::runtime),
                     std::string("No compatible image for ") +
                         KernelInfo.getName().data() + " was found");
 
   auto DeviceHandle = Device.getOLHandle();
-  auto Program = DeviceImage.getOrCreateProgram(DeviceHandle);
+  auto Program = DeviceImage->getOrCreateProgram(DeviceHandle);
 
   ol_symbol_handle_t Kernel{};
   callAndThrow(olGetSymbol, Program, KernelInfo.getName().data(),

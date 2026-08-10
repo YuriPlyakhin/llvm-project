@@ -166,6 +166,19 @@ void SPIRV::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());
 
+  // A SYCL fat binary is produced by clang-linker-wrapper, which drives the
+  // device link itself by re-invoking the driver with --sycl-link once per
+  // device image. It discards this command apart from its executable, which it
+  // reports as its own --linker-path=, so all this job has to name is the tool
+  // that will finalize the images.
+  if (JA.getType() == types::TY_SYCL_FATBIN) {
+    C.addCommand(std::make_unique<Command>(
+        JA, *this, ResponseFileSupport::None(),
+        Args.MakeArgString(ToolChain.GetProgramPath("clang-sycl-linker")),
+        CmdArgs, Inputs, Output));
+    return;
+  }
+
   // TODO: Consider moving SPIR-V linking to a separate tool.
   if (ToolChain.isUsingLTO(Args)) {
     // Implement limited LTO support through llvm-lto.

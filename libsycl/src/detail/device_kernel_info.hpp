@@ -18,6 +18,9 @@
 
 #include <sycl/__impl/detail/config.hpp>
 
+#include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/SmallVector.h>
+
 #include <OffloadAPI.h>
 
 _LIBSYCL_BEGIN_NAMESPACE_SYCL
@@ -33,21 +36,27 @@ public:
   /// Constructs a device kernel info instance.
   ///
   /// \param KernelName the name of the kernel.
-  /// \param DeviceImage the device image containing device code of this kernel.
+  /// \param DeviceImage a device image containing device code of this kernel.
   DeviceKernelInfo(std::string_view KernelName, DeviceImageManager &DeviceImage)
-      : MName(KernelName), MDeviceImage(DeviceImage) {}
+      : MName(KernelName), MDeviceImages({&DeviceImage}) {}
 
   /// \return the name of this kernel.
   std::string_view getName() { return MName; }
 
-  /// \return the device image containing the device code of this kernel.
-  DeviceImageManager &getDeviceImage() const { return MDeviceImage; }
+  /// A kernel can be offered by more than one device image, because a fat
+  /// binary holds an image per architecture it was built for, and the device
+  /// code of an architecture can be split into several images. Which of them
+  /// to use is only known once the device is.
+  /// \return the device images containing the device code of this kernel.
+  llvm::ArrayRef<DeviceImageManager *> getDeviceImages() const {
+    return MDeviceImages;
+  }
 
 private:
   std::unordered_map<ol_device_handle_t, ol_symbol_handle_t> MBuiltKernels;
 
   std::string_view MName;
-  DeviceImageManager &MDeviceImage;
+  llvm::SmallVector<DeviceImageManager *, 1> MDeviceImages;
 
   /// Searches for the existing kernel handle compatible with the specified
   /// device.
@@ -59,6 +68,12 @@ private:
     if (KernelIt == MBuiltKernels.end())
       return nullptr;
     return KernelIt->second;
+  }
+
+  /// Records another device image that offers this kernel.
+  /// \param DeviceImage the device image to add.
+  void addDeviceImage(DeviceImageManager &DeviceImage) {
+    MDeviceImages.push_back(&DeviceImage);
   }
 
   /// Attaches a liboffload kernel handle to this device kernel info object.

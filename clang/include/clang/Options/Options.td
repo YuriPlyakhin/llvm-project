@@ -7735,6 +7735,17 @@ def fsycl_host_only : Flag<["-"], "fsycl-host-only">,
 def sycl_link : Flag<["--"], "sycl-link">, Flags<[HelpHidden]>,
   HelpText<"Perform link through clang-sycl-linker via the target "
   "offloading toolchain.">;
+def fsycl_rdc : Flag<["-"], "fsycl-rdc">,
+  Visibility<[ClangOption, CC1Option]>, Alias<fgpu_rdc>,
+  HelpText<"Generate relocatable SYCL device code, also known as separate "
+  "compilation mode (default). Device symbols may be referenced across "
+  "translation units and are resolved by a device link step.">;
+def fno_sycl_rdc : Flag<["-"], "fno-sycl-rdc">,
+  Visibility<[ClangOption, CC1Option]>, Alias<fno_gpu_rdc>,
+  HelpText<"Generate non-relocatable SYCL device code. Each translation "
+  "unit's device code is self-contained; with -c the final device binary is "
+  "produced within the generated fat object. Cross-translation-unit device "
+  "references (e.g. via SYCL_EXTERNAL) are not resolved in this mode.">;
 def fsycl_device_image_split_EQ : Joined<["-"], "fsycl-device-image-split=">,
   HelpText<"Select the granularity at which SYCL device code is grouped into "
            "device images: kernel (one device image per kernel) | "

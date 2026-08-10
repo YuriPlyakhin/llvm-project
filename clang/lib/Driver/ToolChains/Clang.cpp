@@ -8348,6 +8348,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       assert(HostOffloadingInputs.size() == 1 && "Only one input expected");
       CmdArgs.push_back("-foffload-include-binary");
       CmdArgs.push_back(HostOffloadingInputs.front().getFilename());
+    } else if (IsSYCL && !IsRDCMode) {
+      // The device image is already finalized; embed and register it here
+      // rather than deferring device code to the link step.
+      assert(HostOffloadingInputs.size() == 1 && "Only one input expected");
+      CmdArgs.push_back("-foffload-include-binary");
+      CmdArgs.push_back(Args.MakeArgString(
+          TC.getInputFilename(HostOffloadingInputs.front())));
     } else {
       for (const InputInfo Input : HostOffloadingInputs)
         CmdArgs.push_back(Args.MakeArgString("-fembed-offload-object=" +
@@ -9866,11 +9873,13 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
       OPT_fno_slp_vectorize,
       OPT_hipstdpar};
   const llvm::DenseSet<unsigned> LinkerOptions{OPT_mllvm, OPT_Zlinker_input};
-  // Suppress verbose output for HIP non-RDC fat binaries because it confuses
-  // CMake implicit linker argument parsing.
-  bool SuppressHIPNoRDCVerbose =
-      JA.getType() == types::TY_HIP_FATBIN &&
-      !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false);
+  // Suppress verbose output when a fat binary is emitted directly for
+  // non-relocatable device code, because it confuses CMake implicit linker
+  // argument parsing.
+  bool SuppressNoRDCVerbose =
+      JA.getType() == types::TY_SYCL_FATBIN ||
+      (JA.getType() == types::TY_HIP_FATBIN &&
+       !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false));
   auto ToolChainHasRT = [&](const ToolChain &TC, StringRef Name) {
     return TC.getVFS().exists(
         TC.getCompilerRT(Args, Name, ToolChain::FT_Static));
@@ -9892,7 +9901,7 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
   };
   auto ShouldForward = [&](const llvm::DenseSet<unsigned> &Set, Arg *A,
                            const ToolChain &TC) {
-    if (A->getOption().matches(OPT_v) && SuppressHIPNoRDCVerbose)
+    if (A->getOption().matches(OPT_v) && SuppressNoRDCVerbose)
       return false;
     return (Set.contains(A->getOption().getID()) ||
             (A->getOption().getGroup().isValid() &&
@@ -10010,7 +10019,7 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString("--host-triple=" +
                                          getToolChain().getTripleString()));
 
-  if (Args.hasArg(options::OPT_v) && !SuppressHIPNoRDCVerbose)
+  if (Args.hasArg(options::OPT_v) && !SuppressNoRDCVerbose)
     CmdArgs.push_back("--wrapper-verbose");
   if (Arg *A = Args.getLastArg(options::OPT_cuda_path_EQ)) {
     CmdArgs.push_back(
@@ -10098,10 +10107,12 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
 
   // We use action type to differentiate two use cases of the linker wrapper.
   // TY_Image for normal linker wrapper work.
-  // TY_HIP_FATBIN for HIP device-only links emitting a fat binary directly.
+  // TY_HIP_FATBIN and TY_SYCL_FATBIN for links emitting a fat binary directly,
+  // to be embedded into a host object rather than linked into an image.
   assert(JA.getType() == types::TY_HIP_FATBIN ||
+         JA.getType() == types::TY_SYCL_FATBIN ||
          JA.getType() == types::TY_Image);
-  if (JA.getType() == types::TY_HIP_FATBIN) {
+  if (JA.getType() != types::TY_Image) {
     CmdArgs.push_back("--emit-fatbin-only");
     CmdArgs.append({"-o", Output.getFilename()});
     for (auto Input : Inputs)
