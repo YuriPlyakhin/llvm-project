@@ -115,8 +115,9 @@ TEST(ProgramAndKernelManager, CheckRegisterAndUnregister) {
     EXPECT_THAT(KernelNames, Contains(Name));
 
     // Check device image ref correctness in kernel info.
-    auto &DevImage = KernelInfo.getDeviceImage();
-    uint64_t ImageIndex = DevImage.getOffloadBinary().getIndex();
+    ASSERT_THAT(KernelInfo.getDeviceImages(), SizeIs(1u));
+    uint64_t ImageIndex =
+        KernelInfo.getDeviceImages().front()->getOffloadBinary().getIndex();
     if (Name.find("kernel1") != Name.npos)
       EXPECT_EQ(ImageIndex, 0u);
     else

@@ -921,14 +921,34 @@ bundleOpenMP(ArrayRef<OffloadingImage> Images) {
 Expected<SmallVector<std::unique_ptr<MemoryBuffer>>>
 bundleSYCL(ArrayRef<OffloadingImage> Images) {
   SmallVector<std::unique_ptr<MemoryBuffer>> Buffers;
-  for (const OffloadingImage &Image : Images) {
-    // clang-sycl-linker packs outputs into one binary blob. Therefore, it is
-    // passed to Offload Wrapper as is.
-    StringRef S(Image.Image->getBufferStart(), Image.Image->getBufferSize());
+
+  if (DryRun) {
     Buffers.emplace_back(
-        MemoryBuffer::getMemBufferCopy(S, Image.Image->getBufferIdentifier()));
+        MemoryBuffer::getMemBuffer(Images.front().Image->getMemBufferRef(),
+                                   /*RequiresNullTerminator=*/false));
+    return std::move(Buffers);
   }
 
+  SmallVector<OffloadingImage> Entries;
+  for (const OffloadingImage &Image : Images) {
+    auto BinariesOrErr = OffloadBinary::create(Image.Image->getMemBufferRef());
+    if (!BinariesOrErr)
+      return BinariesOrErr.takeError();
+    for (const std::unique_ptr<OffloadBinary> &Binary : *BinariesOrErr) {
+      OffloadingImage &Entry = Entries.emplace_back();
+      Entry.TheImageKind = Binary->getImageKind();
+      Entry.TheOffloadKind = Binary->getOffloadKind();
+      Entry.Flags = Binary->getFlags();
+      for (const auto &[Key, Value] : Binary->strings())
+        Entry.StringData[Key] = Value;
+      Entry.Image = MemoryBuffer::getMemBuffer(
+          Binary->getImage(), Image.Image->getBufferIdentifier(),
+          /*RequiresNullTerminator=*/false);
+    }
+  }
+
+  Buffers.emplace_back(
+      MemoryBuffer::getMemBufferCopy(OffloadBinary::write(Entries)));
   return std::move(Buffers);
 }
 

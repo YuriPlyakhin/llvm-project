@@ -17,6 +17,8 @@
 
 #include <llvm/Frontend/Offloading/Utility.h>
 
+#include <unordered_set>
+
 _LIBSYCL_BEGIN_NAMESPACE_SYCL
 namespace detail {
 
@@ -61,6 +63,11 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
   DeviceImageManagerVec Images;
   Images.reserve(BinOrErr->size());
 
+  // The kernels this binary is the first to offer. A kernel of a fat binary
+  // registered earlier is left with the images of that binary, so that all the
+  // images a kernel can be built from belong to one binary and go away with it.
+  std::unordered_set<std::string_view> KernelsOfThisBinary;
+
   std::lock_guard<std::mutex> Guard(MDataCollectionMutex);
   for (std::unique_ptr<llvm::object::OffloadBinary> &OB : *BinOrErr) {
     if (!checkDeviceImageValidity(*OB))
@@ -75,12 +82,17 @@ void ProgramAndKernelManager::registerFatBin(const void *BinaryStart,
     llvm::offloading::sycl::forEachSymbol(Symbols, [&](llvm::StringRef Name) {
       auto It = MDeviceKernelInfoMap.find(std::string_view(Name));
       if (It == MDeviceKernelInfoMap.end()) {
-        [[maybe_unused]] auto [Iterator, EmplaceSucceeded] =
-            MDeviceKernelInfoMap.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(std::string_view(Name)),
-                std::forward_as_tuple(std::string_view(Name), NewImageWrapper));
-        assert(EmplaceSucceeded && "Kernel name found in multiple images");
+        MDeviceKernelInfoMap.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::string_view(Name)),
+            std::forward_as_tuple(std::string_view(Name), NewImageWrapper));
+        KernelsOfThisBinary.insert(std::string_view(Name));
+      } else if (KernelsOfThisBinary.count(std::string_view(Name))) {
+        // Several images of one fat binary can export the same kernel, because
+        // the binary holds an image per architecture the kernel was built for.
+        // Record every one of them as a candidate; the device the
+        // kernel is launched on is what decides between them.
+        It->second.addDeviceImage(NewImageWrapper);
       }
     });
   }
@@ -128,6 +140,17 @@ static bool isImageCompatible(const DeviceImageManager &Image,
   return IsValid;
 }
 
+/// Picks the image to build a kernel from out of the images offering it.
+/// \return the first image the device can use, or nullptr if it can use none of
+/// them.
+static DeviceImageManager *selectDeviceImage(const DeviceKernelInfo &KernelInfo,
+                                             const DeviceImpl &Device) {
+  for (DeviceImageManager *Image : KernelInfo.getDeviceImages())
+    if (isImageCompatible(*Image, Device))
+      return Image;
+  return nullptr;
+}
+
 ol_symbol_handle_t ProgramAndKernelManager::getOrCreateKernel(
     DeviceKernelInfo &KernelInfo, ContextImpl &Context, DeviceImpl &Device) {
 
@@ -136,16 +159,16 @@ ol_symbol_handle_t ProgramAndKernelManager::getOrCreateKernel(
   if (auto Kernel = KernelInfo.getKernel(Device.getOLHandle()))
     return Kernel;
 
-  auto &DeviceImage = KernelInfo.getDeviceImage();
+  DeviceImageManager *DeviceImage = selectDeviceImage(KernelInfo, Device);
 
-  if (!isImageCompatible(DeviceImage, Device))
+  if (!DeviceImage)
     throw exception(make_error_code(errc::runtime),
                     std::string("No compatible image for ") +
                         KernelInfo.getName().data() + " was found");
 
   auto DeviceHandle = Device.getOLHandle();
   auto Program =
-      DeviceImage.getOrCreateProgram(Context.getOLHandleRef(), DeviceHandle);
+      DeviceImage->getOrCreateProgram(Context.getOLHandleRef(), DeviceHandle);
 
   ol_symbol_handle_t Kernel{};
   callAndThrow(olGetSymbol, Program, KernelInfo.getName().data(),
